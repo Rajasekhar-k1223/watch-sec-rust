@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 
 pub fn get_kernel_modules() -> serde_json::Value {
+    #[allow(unused_mut)]
     let mut modules = Vec::<serde_json::Value>::new();
 
     #[cfg(target_os = "linux")]

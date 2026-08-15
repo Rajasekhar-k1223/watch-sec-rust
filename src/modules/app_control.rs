@@ -1,5 +1,4 @@
 use serde_json::json;
-use lazy_static::lazy_static;
 use std::path::Path;
 
 pub fn evaluate_process(pid_str: &str, name: &str, exe_path: Option<&Path>, blocked_apps: &[String], event_tx: &tokio::sync::mpsc::UnboundedSender<serde_json::Value>) {

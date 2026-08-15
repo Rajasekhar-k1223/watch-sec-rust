@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use std::path::Path;
 
 /// Queue of shadow upload payloads ready to POST to backend
+#[allow(dead_code)]
 static UPLOAD_QUEUE: Mutex<VecDeque<Value>> = Mutex::new(VecDeque::new());
 
 /// Start watching the given paths. Called once during agent init when

@@ -1,19 +1,19 @@
+#[cfg(unix)]
 use serde_json::json;
+#[cfg(unix)]
 use std::fs;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::thread;
-use std::time::Duration;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
 
 #[cfg(unix)]
-pub fn audit_cups_print_jobs() -> serde_json::Value {
+pub fn audit_cups_print_jobs() -> Option<serde_json::Value> {
     // CUPS page log usually holds print job history
     let cups_log_path = "/var/log/cups/page_log";
     
     let mut jobs = Vec::new();
     
     if let Ok(file) = fs::File::open(cups_log_path) {
-        let mut reader = BufReader::new(file);
-        // We could seek to end to just get new jobs, but for an audit we get recent ones
+        let reader = BufReader::new(file);
         let mut lines = Vec::new();
         for line in reader.lines() {
             if let Ok(l) = line {
@@ -21,7 +21,6 @@ pub fn audit_cups_print_jobs() -> serde_json::Value {
             }
         }
         
-        // Grab the last 5 print jobs to report
         for l in lines.iter().rev().take(5) {
             let parts: Vec<&str> = l.split_whitespace().collect();
             if parts.len() >= 6 {
@@ -36,18 +35,19 @@ pub fn audit_cups_print_jobs() -> serde_json::Value {
         }
     }
 
-    json!({
-        "EventType": "PrinterAudit",
-        "RecentJobs": jobs,
-        "JobCount": jobs.len()
-    })
+    if jobs.is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "Type": "PrinterAudit",
+        "Details": format!("RecentJobs: {:?}, JobCount: {}", jobs, jobs.len())
+    }))
 }
 
 #[cfg(windows)]
-pub fn audit_cups_print_jobs() -> serde_json::Value {
-    json!({
-        "EventType": "PrinterAudit",
-        "Status": "Shimmed",
-        "Details": "Windows uses event logs for printer auditing"
-    })
+pub fn audit_cups_print_jobs() -> Option<serde_json::Value> {
+    // Windows printer auditing requires Event Log hooking which is handled separately.
+    // Return None here so we don't spam fake "PrintJob" events every 30 seconds.
+    None
 }

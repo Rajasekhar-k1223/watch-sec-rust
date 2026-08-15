@@ -27,8 +27,20 @@ for target in "${TARGETS[@]}"; do
     echo "[BUILD] Building for $target -> ${OUTPUT_DIR}/${APP_NAME}-${target}${EXT}"
     cargo build --release --target "$target"
     
-    # Copy to dist
-    cp "target/${target}/release/${APP_NAME}${EXT}" "${OUTPUT_DIR}/${APP_NAME}-${target}${EXT}"
+    if [[ "$target" == *"windows"* ]]; then
+        echo "[SIGN] Signing ${APP_NAME}-${target}${EXT} with Monitorix Publisher Certificate..."
+        rm -f "${OUTPUT_DIR}/${APP_NAME}-${target}${EXT}"
+        osslsigncode sign \
+            -certs /opt/apps/monitorix/certs/codesign/codesign.crt \
+            -key /opt/apps/monitorix/certs/codesign/codesign.key \
+            -n "Monitorix Agent" \
+            -i "https://monitorix.local" \
+            -in "target/${target}/release/${APP_NAME}${EXT}" \
+            -out "${OUTPUT_DIR}/${APP_NAME}-${target}${EXT}"
+    else
+        # Copy to dist for non-windows
+        cp "target/${target}/release/${APP_NAME}${EXT}" "${OUTPUT_DIR}/${APP_NAME}-${target}${EXT}"
+    fi
 done
 
 echo "=== Build Complete ==="

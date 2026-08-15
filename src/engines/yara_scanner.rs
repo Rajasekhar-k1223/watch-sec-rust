@@ -1,4 +1,3 @@
-use std::process::Command;
 
 pub fn scan_file(file_path: &str, rule_path: &str) -> Result<String, String> {
     println!("[YaraScanner] Scanning file {} with rules {}", file_path, rule_path);

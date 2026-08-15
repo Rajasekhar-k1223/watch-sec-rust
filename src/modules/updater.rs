@@ -1,7 +1,4 @@
-use std::process::Command;
 use std::fs::File;
-use std::io::Write;
-use std::path::PathBuf;
 
 pub fn trigger_update(download_url: &str, expected_hash: &str, publisher_signature: &str) -> Result<String, String> {
     crate::log_msg(&format!("[Updater] Initiating auto-update from {} (Expected Hash: {})", download_url, expected_hash));

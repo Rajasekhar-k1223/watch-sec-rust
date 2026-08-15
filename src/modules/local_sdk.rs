@@ -1,4 +1,6 @@
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -7,6 +9,7 @@ use serde_json::Value;
 
 pub fn start_sdk_server() -> broadcast::Sender<Value> {
     let (tx, _rx) = broadcast::channel::<Value>(100);
+    #[allow(unused_variables)]
     let tx_clone = tx.clone();
 
     #[cfg(unix)]

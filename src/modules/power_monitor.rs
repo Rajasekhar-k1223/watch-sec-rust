@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 pub fn get_power_status() -> Value {
     let mut percent = 100;
     let mut plugged = true;
-    let mut time_left = -1;
+    let time_left = -1_i32;
 
     #[cfg(target_os = "linux")]
     {

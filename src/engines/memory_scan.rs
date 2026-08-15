@@ -1,9 +1,10 @@
 use serde_json::json;
+#[cfg(unix)]
 use std::fs;
-use std::path::Path;
 
 /// Scan running processes for suspicious memory segments (like anonymous rwx)
 pub fn scan_memory() -> serde_json::Value {
+    #[allow(unused_mut)]
     let mut suspicious_pids = Vec::<String>::new();
 
     #[cfg(unix)]
@@ -64,6 +65,7 @@ pub fn scan_memory() -> serde_json::Value {
 
 /// Check kernel logs for exploit activity (segfaults, traps)
 pub fn detect_exploits() -> serde_json::Value {
+    #[allow(unused_mut)]
     let mut exploit_indicators = Vec::<String>::new();
 
     #[cfg(unix)]

@@ -1,5 +1,4 @@
 use serde_json::json;
-use std::process::Command;
 
 pub fn audit_firewall() -> serde_json::Value {
     let mut input_policy = "UNKNOWN".to_string();

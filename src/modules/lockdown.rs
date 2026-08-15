@@ -1,4 +1,3 @@
-use std::process::Command;
 use std::fs;
 use ring::digest::{Context, SHA256};
 use std::path::Path;

@@ -1,4 +1,3 @@
-use std::process::Command;
 
 pub fn manage_service(service_name: &str, action: &str) -> Result<String, String> {
     let act = match action.to_lowercase().as_str() {

@@ -1,4 +1,3 @@
-use std::process::Command;
 use serde_json::json;
 
 pub fn block_bluetooth() -> Result<String, String> {

@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use serde_json::json;
 
 #[cfg(target_os = "linux")]

@@ -172,11 +172,24 @@ async fn main() {
         crate::log_msg(&msg);
     }));
 
-    // Single instance lock
-    let _instance_lock = match std::net::TcpListener::bind("127.0.0.1:48392") {
+    let mut session_id: u32 = 1;
+    #[cfg(target_os = "windows")]
+    {
+        unsafe {
+            windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+                std::process::id(),
+                &mut session_id,
+            );
+        }
+        log_msg(&format!("[Boot] Detected Windows Session ID: {}", session_id));
+    }
+
+    // Single instance lock (per session)
+    let lock_port = 48392 + session_id as u16;
+    let _instance_lock = match std::net::TcpListener::bind(format!("127.0.0.1:{}", lock_port)) {
         Ok(listener) => listener,
         Err(_) => {
-            log_msg("[Boot] Another agent instance is already running. Exiting.");
+            log_msg(&format!("[Boot] Another agent instance is already running in Session {}. Exiting.", session_id));
             std::process::exit(0);
         }
     };
@@ -288,9 +301,41 @@ async fn main() {
     let activity_config = config.clone();
     tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(30)); // Activity audit every 30s
+        
+        // Track idle time: if we haven't seen an active window in IDLE_REPORT_INTERVAL,
+        // send a SystemIdle event so the backend always has continuity.
+        // This handles systems that sit untouched for hours, days, or weeks.
+        const IDLE_REPORT_INTERVAL_SECS: u64 = 300; // Report idle every 5 minutes
+        let mut last_active_report = std::time::Instant::now();
+        let mut last_idle_report = std::time::Instant::now();
+
         loop {
             interval.tick().await;
-            if let Some(mut activity) = modules::session_activity::get_active_window() {
+
+            let mut is_service = false;
+            #[cfg(target_os = "windows")]
+            {
+                unsafe {
+                    let mut s_id = 0;
+                    windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+                        std::process::id(),
+                        &mut s_id,
+                    );
+                    if s_id == 0 {
+                        is_service = true;
+                    }
+                }
+            }
+
+            if is_service {
+                // Background service in Session 0 cannot see UI. Skip activity tracking to avoid false 'Idle' logs.
+                continue;
+            }
+
+            let active_window = modules::session_activity::get_active_window().await;
+
+            if let Some(mut activity) = active_window {
+                // --- System is ACTIVE: report the active window ---
                 if let Some(obj) = activity.as_object_mut() {
                     obj.insert("AgentId".to_string(), serde_json::json!(activity_config.agent_id));
                     obj.insert("TenantApiKey".to_string(), serde_json::json!(activity_config.machine_secret));
@@ -312,17 +357,75 @@ async fn main() {
                         .body(body)
                         .send()
                         .await;
+
+                    last_active_report = std::time::Instant::now();
+                }
+            } else {
+                // --- System is IDLE: no active window detected ---
+                // If idle for >= IDLE_REPORT_INTERVAL_SECS, send a SystemIdle event.
+                // This ensures we always have audit continuity — even after days of no interaction.
+                let secs_since_idle_report = last_idle_report.elapsed().as_secs();
+                if secs_since_idle_report >= IDLE_REPORT_INTERVAL_SECS {
+                    let idle_duration_secs = last_active_report.elapsed().as_secs();
+                    let idle_payload = serde_json::json!({
+                        "AgentId":       activity_config.agent_id,
+                        "TenantApiKey":  activity_config.machine_secret,
+                        "ActivityType":  "SystemIdle",
+                        "ProcessName":   "System",
+                        "WindowTitle":   "System Idle",
+                        "Url":           serde_json::Value::Null,
+                        "DurationSeconds": idle_duration_secs,
+                        "Timestamp":     chrono::Utc::now().to_rfc3339(),
+                    });
+
+                    let url = format!("{}/api/events/activity", activity_config.backend_url);
+                    let body = serde_json::to_string(&idle_payload).unwrap_or_default();
+                    let timestamp_str = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        .to_string();
+                    let signature = crate::api::generate_signature(&activity_config.tenant_api_key, &body, &timestamp_str);
+
+                    let _ = activity_client.post(&url)
+                        .header("Content-Type", "application/json")
+                        .header("X-Signature", signature)
+                        .header("X-Timestamp", timestamp_str)
+                        .body(body)
+                        .send()
+                        .await;
+
+                    crate::log_msg(&format!(
+                        "[SessionActivity] System idle for {}s — sent SystemIdle event.",
+                        idle_duration_secs
+                    ));
+
+                    last_idle_report = std::time::Instant::now();
                 }
             }
         }
     });
 
     // Deploy Deception Engine Decoys
-    log_msg("[Boot] Deploying deception decoys...");
-    engines::deception::deploy_decoy();
-    
-    // Deploy Ransomware Decoys
-    engines::ransomware_decoy::deploy_decoy();
+    let mut is_primary_agent = true;
+    #[cfg(target_os = "windows")]
+    {
+        if session_id != 0 {
+            // Check if the service holds the primary lock
+            if std::net::TcpListener::bind("127.0.0.1:48392").is_err() {
+                is_primary_agent = false;
+                log_msg("[Boot] Running in UI Helper Mode. Background scans and C2 disabled.");
+            }
+        }
+    }
+
+    if is_primary_agent {
+        log_msg("[Boot] Deploying deception decoys...");
+        engines::deception::deploy_decoy();
+        
+        // Deploy Ransomware Decoys
+        engines::ransomware_decoy::deploy_decoy();
+    }
     // ── Shared live config ─────────────────────────────────────────────────────
     // The heartbeat response updates runtime toggles (e.g. MailMonitorEnabled).
     // Wrap in an Arc<Mutex<>> so background loops can read the latest value.
@@ -330,70 +433,78 @@ async fn main() {
     let live_config = Arc::new(StdMutex::new(config.clone()));
 
     // Start Command Receiver (WebSocket)
-    let c2_config = config.clone();
-    tokio::spawn(async move {
-        c2::websocket::start(c2_config).await;
-    });
+    if is_primary_agent {
+        let c2_config = config.clone();
+        tokio::spawn(async move {
+            c2::websocket::start(c2_config).await;
+        });
+    }
 
     let rest_client = client.clone();
-    tokio::spawn(async move {
-        let mut interval = time::interval(std::time::Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            let pending = crate::c2::offline_rest_queue::flush_rest_queue();
-            for req in pending {
-                let orig_req = req.clone();
-                let mut req_builder = if req.method == "POST" {
-                    rest_client.post(&req.url)
-                } else {
-                    rest_client.get(&req.url)
-                };
-                for (k, v) in req.headers {
-                    req_builder = req_builder.header(k, v);
-                }
-                let res = req_builder.body(req.body).send().await;
-                if res.is_err() {
-                    // Put back if it fails again
-                    crate::c2::offline_rest_queue::enqueue_rest_request(orig_req);
+    if is_primary_agent {
+        tokio::spawn(async move {
+            let mut interval = time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let pending = crate::c2::offline_rest_queue::flush_rest_queue();
+                for req in pending {
+                    let orig_req = req.clone();
+                    let mut req_builder = if req.method == "POST" {
+                        rest_client.post(&req.url)
+                    } else {
+                        rest_client.get(&req.url)
+                    };
+                    for (k, v) in req.headers {
+                        req_builder = req_builder.header(k, v);
+                    }
+                    let res = req_builder.body(req.body).send().await;
+                    if res.is_err() {
+                        // Put back if it fails again
+                        crate::c2::offline_rest_queue::enqueue_rest_request(orig_req);
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 
     // Event Dispatcher Channel
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
 
-    // Start Ransomware Decoy Watcher
-    engines::ransomware_decoy::watch_decoy(event_tx.clone());
+    if is_primary_agent {
+        // Start Ransomware Decoy Watcher
+        engines::ransomware_decoy::watch_decoy(event_tx.clone());
 
-    // Initialize eBPF Kernel Tracing (Linux Only)
-    engines::ebpf_tracer::start_ebpf_tracer(event_tx.clone());
+        // Initialize eBPF Kernel Tracing (Linux Only)
+        engines::ebpf_tracer::start_ebpf_tracer(event_tx.clone());
 
-    // Start Self-Defense Watchdog
-    modules::self_defense::start_watchdog(event_tx.clone());
+        // Start Self-Defense Watchdog
+        modules::self_defense::start_watchdog(event_tx.clone());
 
-    // Use OS-appropriate paths for File Integrity Monitoring
-    #[cfg(target_os = "windows")]
-    let fim_paths = vec!["C:\\Windows\\System32\\drivers\\etc", "C:\\ProgramData"];
-    #[cfg(not(target_os = "windows"))]
-    let fim_paths = vec!["/etc", "/tmp"];
-    
-    modules::fim::start(fim_paths, event_tx.clone());
+        // Use OS-appropriate paths for File Integrity Monitoring
+        #[cfg(target_os = "windows")]
+        let fim_paths = vec!["C:\\Windows\\System32\\drivers\\etc", "C:\\ProgramData"];
+        #[cfg(not(target_os = "windows"))]
+        let fim_paths = vec!["/etc", "/tmp"];
+        
+        modules::fim::start(fim_paths, event_tx.clone());
+    }
 
 
-    // Start Process and System Monitors
-    modules::process_monitor::start(event_tx.clone(), Arc::clone(&live_config));
-    modules::system_monitor::start(event_tx.clone());
-    // Deception Engine Initialization
-    crate::modules::deception::deploy_honeyfiles(&config.agent_id);
-    let deception_agent_id = config.agent_id.clone();
-    tokio::spawn(async move {
-        crate::modules::deception::deploy_shadow_service(deception_agent_id).await;
-    });
-    // Start asynchronous watchdogs
-    crate::modules::dlp_engine::start_dlp_monitor(event_tx.clone());
-    crate::modules::webmail_monitor::start_webmail_monitor(event_tx.clone());
-    crate::modules::usb_monitor::start_usb_monitor(event_tx.clone());
+    if is_primary_agent {
+        // Start Process and System Monitors
+        modules::process_monitor::start(event_tx.clone(), Arc::clone(&live_config));
+        modules::system_monitor::start(event_tx.clone());
+        // Deception Engine Initialization
+        crate::modules::deception::deploy_honeyfiles(&config.agent_id);
+        let deception_agent_id = config.agent_id.clone();
+        tokio::spawn(async move {
+            crate::modules::deception::deploy_shadow_service(deception_agent_id).await;
+        });
+        // Start asynchronous watchdogs
+        crate::modules::dlp_engine::start_dlp_monitor(event_tx.clone());
+        crate::modules::webmail_monitor::start_webmail_monitor(event_tx.clone());
+        crate::modules::usb_monitor::start_usb_monitor(event_tx.clone());
+    }
     
     // Fallback: Read initial config if present
     // Start AV and Firewall Security Scans
@@ -405,8 +516,10 @@ async fn main() {
     let upload_agent_id     = config.agent_id.clone();
     let upload_machine_secret = config.machine_secret.clone();
     let upload_tenant_key   = config.tenant_api_key.clone();
-    tokio::spawn(async move {
-        // Screenshot interval is configurable — check live_config each iteration
+
+    if is_primary_agent {
+        tokio::spawn(async move {
+            // Screenshot interval is configurable — check live_config each iteration
         let mut last_screenshot = std::time::Instant::now();
         let mut scan_interval = time::interval(std::time::Duration::from_secs(30)); // Base tick: 30s
         loop {
@@ -486,25 +599,32 @@ async fn main() {
             let hw_audit = modules::hardware_audit::audit_hardware();
             let _ = security_tx.send(hw_audit);
 
-            let printer_audit = modules::printer_audit::audit_cups_print_jobs();
-            let _ = security_tx.send(printer_audit.clone());
-            
-            // GAP 4: Print audit not uploaded
-            let mut printer_payload = printer_audit.clone();
-            if let Some(obj) = printer_payload.as_object_mut() {
-                obj.insert("type".to_string(), serde_json::json!("PrintJob"));
-                obj.insert("agent_id".to_string(), serde_json::json!(upload_agent_id.clone()));
-                obj.insert("timestamp".to_string(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+            if let Some(printer_audit) = modules::printer_audit::audit_cups_print_jobs() {
+                let _ = security_tx.send(printer_audit.clone());
+                
+                // GAP 4: Print audit not uploaded
+                let mut printer_payload = printer_audit.clone();
+                let ts = chrono::Utc::now().timestamp().to_string();
+                if let Some(obj) = printer_payload.as_object_mut() {
+                    obj.insert("Type".to_string(), serde_json::json!("PrintJob"));
+                    obj.insert("AgentId".to_string(), serde_json::json!(upload_agent_id.clone()));
+                    obj.insert("Timestamp".to_string(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+                }
+                let client_clone = upload_client.clone();
+                let url = format!("{}/api/events/report", upload_backend_url);
+                let body_str = serde_json::to_string(&printer_payload).unwrap_or_default();
+                let sig = crate::api::generate_signature(&upload_machine_secret, &body_str, &ts);
+                
+                tokio::spawn(async move {
+                    let _ = client_clone.post(&url)
+                        .header("Content-Type", "application/json")
+                        .header("X-Signature", sig)
+                        .header("X-Timestamp", ts)
+                        .body(body_str)
+                        .send()
+                        .await;
+                });
             }
-            let client_clone = upload_client.clone();
-            let url = format!("{}/api/events/report", upload_backend_url);
-            tokio::spawn(async move {
-                let _ = client_clone.post(&url)
-                    .header("Content-Type", "application/json")
-                    .json(&printer_payload)
-                    .send()
-                    .await;
-            });
 
             let periph_audit = modules::peripheral_audit::audit_peripherals();
             let _ = security_tx.send(periph_audit);
@@ -547,7 +667,7 @@ async fn main() {
 
             // Read live config snapshot for this tick
             let (screenshots_on, screenshot_interval, input_audit_on,
-                 shadow_on, shadow_paths, voice_on, mail_on, vuln_on,
+                 shadow_on, shadow_paths, voice_on, mail_on, _vuln_on,
                  clipboard_audit_on,
                  agent_id, backend_url, machine_secret, tenant_key) = {
                 let lc = live_config_scan.lock().unwrap();
@@ -593,16 +713,21 @@ async fn main() {
                 let clipboard = modules::clipboard_audit::audit_clipboard();
                 if let Some(contents) = clipboard.get("ClipboardContents").and_then(|v| v.as_str()) {
                     if !contents.is_empty() && contents != "[Clipboard is empty]" {
-                        let mut payload = serde_json::json!({
-                            "type":      "ClipboardCapture",
-                            "agent_id":  agent_id,
-                            "content":   contents,
-                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                        let payload = serde_json::json!({
+                            "Type":      "ClipboardCapture",
+                            "AgentId":  agent_id,
+                            "Details":   contents,
+                            "Timestamp": chrono::Utc::now().to_rfc3339(),
                         });
                         let url = format!("{}/api/events/report", backend_url);
+                        let body_str = serde_json::to_string(&payload).unwrap_or_default();
+                        let ts = chrono::Utc::now().timestamp().to_string();
+                        let sig = crate::api::generate_signature(&machine_secret, &body_str, &ts);
                         let _ = upload_client.post(&url)
                             .header("Content-Type", "application/json")
-                            .json(&payload)
+                            .header("X-Signature", sig)
+                            .header("X-Timestamp", ts)
+                            .body(body_str)
                             .send()
                             .await;
                     }
@@ -640,13 +765,18 @@ async fn main() {
                 if let Some(keystroke_report) = modules::input_audit::flush_keystroke_buffer() {
                     let mut payload = keystroke_report;
                     if let Some(obj) = payload.as_object_mut() {
-                        obj.insert("agent_id".to_string(),     serde_json::json!(agent_id));
-                        obj.insert("TenantApiKey".to_string(), serde_json::json!(machine_secret));
+                        obj.insert("AgentId".to_string(),     serde_json::json!(agent_id));
+                        // obj.insert("TenantApiKey".to_string(), serde_json::json!(machine_secret));
                     }
                     let url = format!("{}/api/events/report", backend_url);
+                    let body_str = serde_json::to_string(&payload).unwrap_or_default();
+                    let ts = chrono::Utc::now().timestamp().to_string();
+                    let sig = crate::api::generate_signature(&machine_secret, &body_str, &ts);
                     let _ = upload_client.post(&url)
                         .header("Content-Type", "application/json")
-                        .json(&payload)
+                        .header("X-Signature", sig)
+                        .header("X-Timestamp", ts)
+                        .body(body_str)
                         .send()
                         .await;
                 }
@@ -849,6 +979,7 @@ async fn main() {
             }
         }
     });
+    }
 
     let mut interval = time::interval(Duration::from_secs(30)); // Full heartbeat every 30s — expensive sysinfo refresh_all
 

@@ -1,5 +1,4 @@
 use serde_json::json;
-use std::process::Command;
 
 pub fn get_installed_packages() -> serde_json::Value {
     let mut packages = Vec::new();

@@ -1,6 +1,5 @@
 use serde_json::json;
 use std::fs;
-use std::process::Command;
 
 pub fn audit_boot() -> serde_json::Value {
     let mut uptime_seconds = 0.0;

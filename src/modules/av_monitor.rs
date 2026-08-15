@@ -1,11 +1,9 @@
-#[cfg(windows)]
-use std::process::Command;
 use sysinfo::System;
 use serde_json::json;
 
 pub fn check_av_status() -> serde_json::Value {
     let mut av_found = false;
-    let mut details = String::new();
+    let mut details = String::from("Unknown");
 
     #[cfg(unix)]
     {

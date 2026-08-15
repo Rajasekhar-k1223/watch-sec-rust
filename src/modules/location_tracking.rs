@@ -1,5 +1,4 @@
 use serde_json::json;
-use std::process::Command;
 
 pub fn track_location() -> serde_json::Value {
     let mut location_data = json!({"error": "Failed to retrieve location via curl"});

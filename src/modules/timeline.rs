@@ -1,6 +1,5 @@
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::process::Command;
 
 pub fn generate_timeline() -> serde_json::Value {
     let mut timeline = Vec::new();

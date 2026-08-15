@@ -103,6 +103,7 @@ pub fn generate_signature(secret: &str, body: &str, timestamp: &str) -> String {
     hex::encode(signature.as_ref())
 }
 
+#[allow(dead_code)]
 fn generate_events_signature(secret: &str, body: &str, timestamp: &str) -> String {
     // The Python backend is inconsistent: /events does NOT SHA256 the secret before HMAC,
     // and it does NOT use a pipe '|' between body and timestamp.
@@ -327,6 +328,7 @@ pub async fn send_telemetry(client: &Client, config: &AgentConfig) -> Result<(),
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn send_events(client: &Client, config: &AgentConfig, events: &[serde_json::Value]) -> Result<(), Box<dyn std::error::Error>> {
     if events.is_empty() {
         return Ok(());

@@ -52,7 +52,6 @@ pub fn edit_registry(path: &str, key: &str, value: &str) -> Result<String, Strin
     #[cfg(unix)]
     {
         if cfg!(target_os = "macos") {
-            use std::process::Command;
             let output = crate::hidden_command!("defaults")
                 .args(&["write", path, key, value])
                 .output()
@@ -72,7 +71,6 @@ pub fn edit_registry(path: &str, key: &str, value: &str) -> Result<String, Strin
 pub fn export_registry_key(path: &str, output_path: &str) -> Result<String, String> {
     #[cfg(windows)]
     {
-        use std::process::Command;
         let output = crate::hidden_command!("reg")
             .args(&["export", path, output_path, "/y"])
             .output()
@@ -88,7 +86,6 @@ pub fn export_registry_key(path: &str, output_path: &str) -> Result<String, Stri
     #[cfg(unix)]
     {
         if cfg!(target_os = "macos") {
-            use std::process::Command;
             let output = crate::hidden_command!("defaults")
                 .args(&["read", path])
                 .output()
@@ -101,7 +98,6 @@ pub fn export_registry_key(path: &str, output_path: &str) -> Result<String, Stri
                 Err(format!("defaults read failed: {}", String::from_utf8_lossy(&output.stderr)))
             }
         } else {
-            use std::process::Command;
             // On Linux, export is mapped to tarballing the config directory (e.g. /etc)
             let output = crate::hidden_command!("tar")
                 .args(&["-czf", output_path, path])

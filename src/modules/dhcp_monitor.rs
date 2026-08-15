@@ -1,9 +1,8 @@
 use serde_json::json;
-use std::process::Command;
 
 pub fn audit_dhcp() -> serde_json::Value {
-    let mut dhcp_events = Vec::<String>::new();
-    
+    let mut dhcp_events: Vec<String> = Vec::new();
+
     #[cfg(unix)]
     {
         // Simple heuristic: grep journalctl for DHCPACK or DHCPREQUEST
@@ -17,9 +16,10 @@ pub fn audit_dhcp() -> serde_json::Value {
         }
     }
 
+    let is_empty = dhcp_events.is_empty();
     json!({
         "EventType": "DHCPMonitorReport",
         "RecentEvents": dhcp_events,
-        "Status": if dhcp_events.is_empty() { "No recent DHCP activity" } else { "DHCP Activity Detected" }
+        "Status": if is_empty { "No recent DHCP activity" } else { "DHCP Activity Detected" }
     })
 }

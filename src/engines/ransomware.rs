@@ -20,6 +20,7 @@ fn current_timestamp() -> u64 {
 pub fn evaluate_file_action(pid: u32, action_type: &str, entropy: f64) -> bool {
     let now = current_timestamp();
     let mut trigger_quarantine = false;
+    #[allow(unused_assignments)]
     let mut current_score = 0;
 
     {

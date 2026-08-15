@@ -339,6 +339,7 @@ fn parse_mbox_file(path: &std::path::Path) -> Vec<Value> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Best-effort MIME type guess from filename extension.
+#[allow(dead_code)]
 fn guess_content_type(filename: &str) -> &'static str {
     let lower = filename.to_ascii_lowercase();
     if lower.ends_with(".pdf")                                    { return "application/pdf"; }

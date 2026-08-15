@@ -1,4 +1,3 @@
-use std::process::Command;
 use serde_json::json;
 
 pub fn get_local_users() -> serde_json::Value {

@@ -1,5 +1,4 @@
 use serde_json::json;
-use std::process::Command;
 
 pub fn audit_clipboard() -> serde_json::Value {
     let mut contents = "No active display or xclip missing".to_string();

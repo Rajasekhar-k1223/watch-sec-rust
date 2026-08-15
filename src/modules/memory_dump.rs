@@ -1,4 +1,3 @@
-use std::process::Command;
 use std::fs;
 
 pub fn trigger_memory_dump(pid: &str, output_dir: &str) -> Result<String, String> {
@@ -43,5 +42,8 @@ pub fn trigger_memory_dump(pid: &str, output_dir: &str) -> Result<String, String
     }
     
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    Err("Memory dump not supported on this OS".to_string())
+    {
+        let _ = dump_file; // suppress unused warning on other platforms
+        Err("Memory dump not supported on this OS".to_string())
+    }
 }

@@ -17,7 +17,7 @@ pub fn start(event_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>) {
             
             #[cfg(not(target_os = "macos"))]
             {
-                let mut components = sysinfo::Components::new_with_refreshed_list();
+                let components = sysinfo::Components::new_with_refreshed_list();
                 if let Some(c) = components.list().iter().next() {
                     temp = format!("{:.1}°C", c.temperature());
                 }

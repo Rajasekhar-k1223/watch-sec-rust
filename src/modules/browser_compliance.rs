@@ -7,11 +7,13 @@ pub fn audit_browsers() -> serde_json::Value {
     #[cfg(not(target_os = "windows"))]
     let chrome_ext_path = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()) + "/.config/google-chrome/Default/Extensions";
     #[cfg(not(target_os = "windows"))]
+    #[allow(unused_mut)]
     let mut paths_to_check = vec![("Chrome", chrome_ext_path)];
     
     #[cfg(target_os = "windows")]
     let appdata = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| r"C:\Users\Default\AppData\Local".to_string());
     #[cfg(target_os = "windows")]
+    #[allow(unused_mut)]
     let mut paths_to_check = vec![
         ("Chrome", format!(r"{}\Google\Chrome\User Data\Default\Extensions", appdata)),
         ("Edge", format!(r"{}\Microsoft\Edge\User Data\Default\Extensions", appdata))

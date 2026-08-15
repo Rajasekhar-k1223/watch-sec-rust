@@ -1,16 +1,20 @@
-use std::process::Command;
 use serde_json::json;
 
-pub fn get_active_window() -> Option<serde_json::Value> {
+pub async fn get_active_window() -> Option<serde_json::Value> {
     let mut window_title = String::new();
+    #[allow(unused_assignments)]
     let mut process_name = String::new();
 
+    #[allow(unused_mut)]
     let mut url = String::new();
 
     #[cfg(unix)]
     {
         // Try to use xdotool if available
-        if let Ok(output) = crate::hidden_command!("xdotool").arg("getactivewindow").arg("getwindowname").output() {
+        if let Ok(Ok(output)) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::process::Command::new("xdotool").arg("getactivewindow").arg("getwindowname").output()
+        ).await {
             window_title = String::from_utf8_lossy(&output.stdout).trim().to_string();
         }
         process_name = "Unknown(Linux)".to_string();
@@ -24,72 +28,39 @@ pub fn get_active_window() -> Option<serde_json::Value> {
 
     #[cfg(windows)]
     {
-        // PowerShell heuristic to get foreground window title, process name, and UIA URL
-        let script = r#"
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class Win32 {
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int count);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-    public static uint GetProcessId(IntPtr hWnd) {
-        uint pid = 0;
-        GetWindowThreadProcessId(hWnd, out pid);
-        return pid;
-    }
-}
-"@
-$handle = [Win32]::GetForegroundWindow()
-$builder = New-Object System.Text.StringBuilder 256
-[Win32]::GetWindowText($handle, $builder, 256) | Out-Null
-$pid_val = [Win32]::GetProcessId($handle)
+        use windows::Win32::Foundation::{HWND, MAX_PATH};
+        use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId};
+        use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION};
+        use std::os::windows::ffi::OsStringExt;
+        use std::ffi::OsString;
 
-$procName = "Unknown"
-if ($pid_val -gt 0) {
-    try {
-        $process = Get-Process -Id $pid_val -ErrorAction Stop
-        $procName = $process.ProcessName
-    } catch {
-        try {
-            $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $pid_val" -ErrorAction Stop
-            if ($cim) { $procName = $cim.Name }
-        } catch {}
-    }
-}
-$title = $builder.ToString()
+        unsafe {
+            let hwnd: HWND = GetForegroundWindow();
+            if hwnd.0 != std::ptr::null_mut() {
+                let mut title_buf = [0u16; 512];
+                let len = GetWindowTextW(hwnd, &mut title_buf);
+                if len > 0 {
+                    window_title = String::from_utf16_lossy(&title_buf[..len as usize]);
+                }
 
-$extractedUrl = ""
-if ($procName -match "chrome|msedge|firefox|brave|opera") {
-    try {
-        $rootElement = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
-        $condEdit = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
-        $editEl = $rootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condEdit)
-        if ($editEl) {
-            $valPattern = $editEl.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern) -as [System.Windows.Automation.ValuePattern]
-            if ($valPattern) {
-                $extractedUrl = $valPattern.Current.Value
-            }
-        }
-    } catch {}
-}
-
-Write-Output "$title|||$procName|||$extractedUrl"
-"#;
-        if let Ok(output) = crate::hidden_command!("powershell")
-            .args(&["-NoProfile", "-Command", script])
-            .output() 
-        {
-            let out_str = String::from_utf8_lossy(&output.stdout);
-            let parts: Vec<&str> = out_str.trim().split("|||").collect();
-            if parts.len() >= 2 {
-                window_title = parts[0].to_string();
-                process_name = parts[1].to_string();
-            }
-            if parts.len() >= 3 {
-                url = parts[2].trim().to_string();
+                let mut pid: u32 = 0;
+                GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                
+                if pid > 0 {
+                    if let Ok(process_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                        let mut exe_path_buf = [0u16; MAX_PATH as usize];
+                        let mut path_len = MAX_PATH;
+                        if QueryFullProcessImageNameW(process_handle, windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0), windows::core::PWSTR(exe_path_buf.as_mut_ptr()), &mut path_len).is_ok() {
+                            let full_path = OsString::from_wide(&exe_path_buf[..path_len as usize]).to_string_lossy().into_owned();
+                            if let Some(name) = std::path::Path::new(&full_path).file_name() {
+                                process_name = name.to_string_lossy().into_owned();
+                            } else {
+                                process_name = full_path;
+                            }
+                        }
+                        let _ = windows::Win32::Foundation::CloseHandle(process_handle);
+                    }
+                }
             }
         }
     }
@@ -103,6 +74,6 @@ Write-Output "$title|||$procName|||$extractedUrl"
         "ProcessName": process_name,
         "WindowTitle": window_title,
         "Url": if url.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(url) },
-        "DurationSeconds": 5.0,
+        "DurationSeconds": 30.0,
     }))
 }

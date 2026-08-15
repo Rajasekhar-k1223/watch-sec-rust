@@ -52,6 +52,7 @@ pub fn verify_command_signature(
     expected == signature
 }
 
+#[allow(dead_code)]
 pub const MONITORIX_PUBLISHER_CERT_PEM: &str = r#"
 -----BEGIN CERTIFICATE-----
 MIIDaTCCAlGgAwIBAgIUZG1hC9h2q1X7gXn3...

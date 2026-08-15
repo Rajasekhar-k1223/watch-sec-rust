@@ -27,6 +27,7 @@ pub fn audit_hardware() -> serde_json::Value {
         battery_level = format!("{}%", content.trim());
     }
     // Check GPU (Linux)
+    #[allow(unused_mut)]
     let mut gpus = Vec::<String>::new();
     #[cfg(unix)]
     {
@@ -40,6 +41,7 @@ pub fn audit_hardware() -> serde_json::Value {
         }
     }
 
+    #[allow(unused_mut)]
     let mut secure_enclave_status = "N/A".to_string();
     #[cfg(target_os = "macos")]
     {
