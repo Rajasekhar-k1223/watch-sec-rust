@@ -20,7 +20,8 @@ pub fn get_installed_software() -> String {
     {
         let cache = SOFTWARE_CACHE.lock().unwrap();
         if let Some((cached_json, timestamp)) = &*cache {
-            if timestamp.elapsed() < Duration::from_secs(3600) {
+            // [FIX] Reduced cache from 1 hour to 5 minutes so newly installed software appears faster
+            if timestamp.elapsed() < Duration::from_secs(300) {
                 return cached_json.clone();
             }
         }
