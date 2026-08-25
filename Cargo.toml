@@ -27,6 +27,7 @@ chrono = "0.4"
 base64 = "0.23.1"
 enigo = "0.1"
 arboard = "3.6.1"
+image = "0.25.10"
 [target.'cfg(windows)'.dependencies]
 wmi = "0.13"
 winreg = "0.52"
@@ -45,3 +46,7 @@ strip = true     # Automatically strip symbols from the binary.
 [[bin]]
 name = "test_net"
 path = "test_net.rs"
+
+[[bin]]
+name = "monitorix-screencapture"
+path = "src/bin/screencapture.rs"

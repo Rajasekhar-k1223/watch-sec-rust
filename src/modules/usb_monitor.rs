@@ -33,23 +33,31 @@ pub fn get_connected_usbs() -> Vec<serde_json::Value> {
 
     #[cfg(windows)]
     {
-        let cmd = crate::hidden_command!("powershell")
-            .arg("-NoProfile")
-            .arg("-Command")
-            // Query WMI for external USB drives
-            .arg("Get-CimInstance Win32_DiskDrive | Where-Object MediaType -match 'External' | Select-Object Model, Size, DeviceID | ConvertTo-Json -Compress")
-            .output();
+        use wmi::{COMLibrary, WMIConnection};
+        use serde::Deserialize;
 
-        if let Ok(output) = cmd {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !stdout.is_empty() {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                    if let Some(arr) = parsed.as_array() {
-                        for item in arr {
-                            usbs.push(item.clone());
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "PascalCase")]
+        struct Win32_DiskDrive {
+            pub model: Option<String>,
+            pub size: Option<u64>,
+            pub device_id: Option<String>,
+            pub media_type: Option<String>,
+        }
+
+        if let Ok(com_con) = COMLibrary::new() {
+            if let Ok(wmi_con) = WMIConnection::with_namespace_path("ROOT\\CIMV2", com_con.into()) {
+                if let Ok(results) = wmi_con.raw_query::<Win32_DiskDrive>("SELECT Model, Size, DeviceID, MediaType FROM Win32_DiskDrive") {
+                    for drive in results {
+                        if let Some(media) = drive.media_type {
+                            if media.to_lowercase().contains("external") {
+                                usbs.push(json!({
+                                    "Model": drive.model.unwrap_or_default(),
+                                    "Size": drive.size.unwrap_or_default(),
+                                    "DeviceID": drive.device_id.unwrap_or_default(),
+                                }));
+                            }
                         }
-                    } else {
-                        usbs.push(parsed);
                     }
                 }
             }
@@ -87,10 +95,9 @@ pub fn start_usb_monitor(event_tx: tokio::sync::mpsc::UnboundedSender<serde_json
                     
                     #[cfg(windows)]
                     {
-                        let _ = crate::hidden_command!("powershell")
-                            .arg("-NoProfile")
-                            .arg("-Command")
-                            .arg(&format!("Disable-PnpDevice -InstanceId '{}' -Confirm:$false", id.replace("'", "''")))
+                        // Using native pnputil instead of powershell
+                        let _ = crate::hidden_command!("pnputil")
+                            .args(&["/disable-device", &id])
                             .output();
                     }
                     

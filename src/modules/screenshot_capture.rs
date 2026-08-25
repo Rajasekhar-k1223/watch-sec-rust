@@ -88,12 +88,10 @@ fn do_capture() -> bool {
         );
     }
     
-    let ps_script = "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $Screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $Bitmap = New-Object System.Drawing.Bitmap $Screen.Width, $Screen.Height; $Graphics = [System.Drawing.Graphics]::FromImage($Bitmap); $Graphics.CopyFromScreen($Screen.X, $Screen.Y, 0, 0, $Bitmap.Size); $Bitmap.Save('C:\\Users\\Public\\monitorix_screenshot.png', [System.Drawing.Imaging.ImageFormat]::Png); $Graphics.Dispose(); $Bitmap.Dispose()";
+    // NATIVE APPROACH: Execute our secondary helper binary instead of powershell
+    let exe_path = "C:\\Program Files\\Monitorix\\monitorix-screencapture.exe";
 
     if s_id == 0 {
-        // We are running as a Service in Session 0. Screenshots here will be black.
-        // We must bridge into the interactive user's session using schtasks.
-        
         // Find the active interactive user (e.g. RDP session)
         let mut active_user = String::new();
         if let Ok(output) = crate::hidden_command!("cmd").args(&["/c", "query user | findstr /i active"]).output() {
@@ -108,18 +106,9 @@ fn do_capture() -> bool {
             return false; // No active user to capture
         }
 
-        // Encode script to base64 UTF-16LE for PowerShell
-        let mut encoded = Vec::new();
-        for b in ps_script.encode_utf16() {
-            encoded.push((b & 0xFF) as u8);
-            encoded.push((b >> 8) as u8);
-        }
-        let b64_script = base64_encode(&encoded);
-        let cmd = format!("powershell -WindowStyle Hidden -EncodedCommand {}", b64_script);
-
         // Schedule and run the task in the active user's session
         let _ = crate::hidden_command!("schtasks")
-            .args(&["/Create", "/TN", "MonitorixCapture", "/TR", &cmd, "/SC", "ONCE", "/ST", "00:00", "/RU", &active_user, "/IT", "/F"])
+            .args(&["/Create", "/TN", "MonitorixCapture", "/TR", exe_path, "/SC", "ONCE", "/ST", "00:00", "/RU", &active_user, "/IT", "/F"])
             .output();
             
         let _ = crate::hidden_command!("schtasks")
@@ -135,11 +124,8 @@ fn do_capture() -> bool {
         return true;
     }
 
-    // We are already in the interactive user's session (s_id > 0), so we can just run PowerShell directly!
-    let out = crate::hidden_command!("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps_script])
-        .output();
-        
+    // Interactive user session -> run helper directly
+    let out = crate::hidden_command!(exe_path).output();
     out.map(|o| o.status.success()).unwrap_or(false)
 }
 
