@@ -29,32 +29,49 @@ pub fn get_installed_software() -> String {
 
     let mut software_list = Vec::new();
 
-    if cfg!(target_os = "windows") {
-        let output = crate::hidden_command!("powershell")
-            .arg("-NoProfile")
-            .arg("-Command")
-            .arg("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; try { @(Get-ItemProperty HKLM:\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*, HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*, HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -ne $null -and $_.SystemComponent -ne 1 -and $_.ParentKeyName -eq $null } | Select-Object DisplayName, DisplayVersion) | ConvertTo-Json -Compress } catch { '[]' }")
-            .output();
+    #[cfg(windows)]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
 
-        if let Ok(output) = output {
-            let result_str = String::from_utf8_lossy(&output.stdout);
-            let clean_str = result_str.trim().trim_start_matches('\u{FEFF}');
-            if let Ok(apps) = serde_json::from_str::<Vec<serde_json::Value>>(clean_str) {
-                for app in apps {
-                    if let (Some(name), Some(version)) = (
-                        app.get("DisplayName").and_then(|v| v.as_str()),
-                        app.get("DisplayVersion").and_then(|v| v.as_str())
-                    ) {
-                        software_list.push(InstalledSoftware {
-                            name: name.to_string(),
-                            version: version.to_string(),
-                            install_date: None,
-                        });
+        let paths = vec![
+            (RegKey::predef(HKEY_LOCAL_MACHINE), "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+            (RegKey::predef(HKEY_LOCAL_MACHINE), "SOFTWARE\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+            (RegKey::predef(HKEY_CURRENT_USER), "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+        ];
+        
+        for (hive, path) in paths {
+            if let Ok(uninstall_key) = hive.open_subkey_with_flags(path, KEY_READ) {
+                for key_name_res in uninstall_key.enum_keys().map(|x| x.unwrap_or_default()) {
+                    if key_name_res.is_empty() { continue; }
+                    
+                    if let Ok(app_key) = uninstall_key.open_subkey_with_flags(&key_name_res, KEY_READ) {
+                        // Skip system components
+                        if let Ok(sys_comp) = app_key.get_value::<u32, _>("SystemComponent") {
+                            if sys_comp == 1 { continue; }
+                        }
+                        
+                        // Skip if it has a ParentKeyName (it's an update)
+                        if app_key.get_value::<String, _>("ParentKeyName").is_ok() {
+                            continue;
+                        }
+                        
+                        if let Ok(name) = app_key.get_value::<String, _>("DisplayName") {
+                            let version = app_key.get_value::<String, _>("DisplayVersion").unwrap_or_default();
+                            software_list.push(InstalledSoftware {
+                                name,
+                                version,
+                                install_date: None,
+                            });
+                        }
                     }
                 }
             }
         }
-    } else {
+    }
+    
+    #[cfg(not(windows))]
+    {
         // We use dpkg-query as this agent runs on Linux
         let output = crate::hidden_command!("dpkg-query")
             .arg("-W")
