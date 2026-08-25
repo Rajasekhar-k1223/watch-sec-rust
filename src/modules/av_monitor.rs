@@ -30,22 +30,28 @@ pub fn check_av_status() -> serde_json::Value {
 
     #[cfg(windows)]
     {
-        let cmd = crate::hidden_command!("powershell")
-            .arg("-NoProfile")
-            .arg("-Command")
-            .arg("Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntivirusProduct | Select-Object -ExpandProperty displayName")
-            .output();
-            
-        if let Ok(output) = cmd {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !stdout.is_empty() {
-                av_found = true;
-                details = format!("Found AV: {}", stdout);
-            } else {
-                details = "No AV registered in SecurityCenter2".to_string();
+        use wmi::{COMLibrary, WMIConnection};
+        use serde::Deserialize;
+
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "PascalCase")]
+        struct AntivirusProduct {
+            pub display_name: String,
+        }
+
+        if let Ok(com_con) = COMLibrary::new() {
+            if let Ok(wmi_con) = WMIConnection::with_namespace_path("ROOT\\SecurityCenter2", com_con.into()) {
+                if let Ok(results) = wmi_con.raw_query::<AntivirusProduct>("SELECT * FROM AntivirusProduct") {
+                    if let Some(av) = results.into_iter().next() {
+                        av_found = true;
+                        details = format!("Found AV: {}", av.display_name);
+                    } else {
+                        details = "No AV registered in SecurityCenter2".to_string();
+                    }
+                } else {
+                    details = "Failed to query SecurityCenter2 WMI".to_string();
+                }
             }
-        } else {
-            details = "Failed to query SecurityCenter2".to_string();
         }
     }
 
