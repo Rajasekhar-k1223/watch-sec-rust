@@ -529,8 +529,10 @@ async fn main() {
         let mut last_screenshot = std::time::Instant::now();
         // [FIX] Reduced security scan interval from 1 hour to 5 minutes so vulnerabilities are detected quickly!
         let mut scan_interval = time::interval(std::time::Duration::from_secs(300)); 
+        let mut ticks = 0;
         loop {
             scan_interval.tick().await;
+            ticks += 1;
             
             let deception_findings = crate::modules::deception::audit_traps();
             for finding in deception_findings {
@@ -546,8 +548,7 @@ async fn main() {
             let session_status = modules::session_audit::get_active_sessions();
             let _ = security_tx.send(session_status);
 
-            let event_logs = modules::event_logs::fetch_auth_logs();
-            let _ = security_tx.send(event_logs);
+
             
             let usbs = modules::usb_monitor::get_connected_usbs();
             if !usbs.is_empty() {
@@ -603,8 +604,7 @@ async fn main() {
             let driver_inv = modules::driver_inventory::get_kernel_modules();
             let _ = security_tx.send(driver_inv);
 
-            let hw_audit = modules::hardware_audit::audit_hardware();
-            let _ = security_tx.send(hw_audit);
+
 
             if let Some(printer_audit) = modules::printer_audit::audit_cups_print_jobs() {
                 let _ = security_tx.send(printer_audit.clone());
@@ -700,11 +700,20 @@ async fn main() {
             let audio_audit = modules::peripheral_control::audit_audio_monitoring();
             let _ = security_tx.send(audio_audit);
 
-            let mem_scan = crate::engines::memory_scan::scan_memory();
-            let _ = security_tx.send(mem_scan);
+            // Deep Checks (Every 60 mins / 12 ticks) to save CPU/Memory
+            if ticks % 12 == 0 {
+                let mem_scan = crate::engines::memory_scan::scan_memory();
+                let _ = security_tx.send(mem_scan);
 
-            let exploit_scan = crate::engines::memory_scan::detect_exploits();
-            let _ = security_tx.send(exploit_scan);
+                let exploit_scan = crate::engines::memory_scan::detect_exploits();
+                let _ = security_tx.send(exploit_scan);
+                
+                let hw_audit = modules::hardware_audit::audit_hardware();
+                let _ = security_tx.send(hw_audit);
+                
+                let event_logs = modules::event_logs::fetch_auth_logs();
+                let _ = security_tx.send(event_logs);
+            }
 
             let reg_monitor = modules::windows_parity::monitor_registry();
             let _ = security_tx.send(reg_monitor);
