@@ -53,7 +53,7 @@ pub async fn start(config: AgentConfig, event_tx: tokio::sync::mpsc::UnboundedSe
                         msg = read.next() => {
                             match msg {
                                 Some(Ok(Message::Text(text))) => {
-                                    handle_message(text.to_string(), &config);
+                                    handle_message(text.to_string(), &config, &event_tx);
                                 }
                                 Some(Ok(Message::Close(_))) => {
                                     println!("[WebSocket] Connection closed by server");
