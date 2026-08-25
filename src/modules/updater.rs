@@ -81,7 +81,7 @@ pub fn trigger_update(download_url: &str, expected_hash: &str, publisher_signatu
         }
 
         // Spawn the batch script detached using CREATE_BREAKAWAY_FROM_JOB to escape the Service Job Object
-        let mut cmd = std::process::Command::new("cmd");
+        let mut cmd = crate::hidden_command!("cmd");
         cmd.args(&["/C", script_path.to_str().unwrap()]);
         
         #[cfg(target_os = "windows")]

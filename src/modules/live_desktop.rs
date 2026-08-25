@@ -21,12 +21,16 @@ pub fn start_live_desktop(agent_id: String) -> Result<String, String> {
         let mut interval = time::interval(Duration::from_millis(500)); // ~2 FPS
         while active.load(Ordering::SeqCst) {
             interval.tick().await;
-            if let Some(frame_val) = screenshot_capture::capture_screenshot() {
+            let frame_val = tokio::task::spawn_blocking(|| {
+                screenshot_capture::capture_screenshot()
+            }).await.unwrap_or(None);
+
+            if let Some(frame_val) = frame_val {
                 if let Some(b64) = frame_val.get("file_b64").and_then(|v| v.as_str()) {
                     let event = json!([
                         "stream_frame",
                         {
-                            "agent_id": agent_id,
+                            "agent_id": agent_id.clone(),
                             "frame": format!("data:image/jpeg;base64,{}", b64)
                         }
                     ]);

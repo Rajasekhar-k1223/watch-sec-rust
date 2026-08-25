@@ -1,5 +1,13 @@
 use serde_json::json;
 
+use lazy_static::lazy_static;
+use std::sync::Mutex;
+use std::time::Instant;
+
+lazy_static! {
+    static ref LAST_WINDOW: Mutex<Option<(String, String, Instant)>> = Mutex::new(None);
+}
+
 pub async fn get_active_window() -> Option<serde_json::Value> {
     let mut window_title = String::new();
     #[allow(unused_assignments)]
@@ -65,15 +73,41 @@ pub async fn get_active_window() -> Option<serde_json::Value> {
         }
     }
 
-    if window_title.is_empty() {
-        return None;
+    if window_title.is_empty() || process_name.to_lowercase() == "logonui.exe" {
+        // [FIX] When the system is locked or Secure Desktop is active, GetForegroundWindow() returns NULL,
+        // or it may return the LogonUI.exe process.
+        // Instead of ignoring this and crediting the locked time to the last active application, 
+        // we explicitly track it as "System Idle" to close the previous app's duration.
+        window_title = "System Idle".to_string();
+        process_name = "System".to_string();
     }
 
-    Some(json!({
-        "ActivityType": "AppFocus",
-        "ProcessName": process_name,
-        "WindowTitle": window_title,
-        "Url": if url.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(url) },
-        "DurationSeconds": 30.0,
-    }))
+    let now = Instant::now();
+    let mut last_window_guard = LAST_WINDOW.lock().unwrap();
+    
+    // Check if the window changed
+    if let Some((last_title, last_process, last_time)) = last_window_guard.as_ref() {
+        if last_title == &window_title && last_process == &process_name {
+            // Window hasn't changed, do not emit a new event yet
+            return None;
+        }
+        
+        // Window changed, calculate duration for the previous window
+        let duration = now.duration_since(*last_time).as_secs_f64();
+        let payload = Some(json!({
+            "ActivityType": "AppFocus",
+            "ProcessName": last_process,
+            "WindowTitle": last_title,
+            "Url": if url.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(url.clone()) },
+            "DurationSeconds": duration,
+        }));
+        
+        // Update the tracked window to the new one
+        *last_window_guard = Some((window_title, process_name, now));
+        return payload;
+    } else {
+        // First time seeing a window, just start tracking it
+        *last_window_guard = Some((window_title, process_name, now));
+        return None;
+    }
 }

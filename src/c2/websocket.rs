@@ -9,7 +9,7 @@ lazy_static::lazy_static! {
     pub static ref WS_TX: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<String>>> = std::sync::Mutex::new(None);
 }
 
-pub async fn start(config: AgentConfig) {
+pub async fn start(config: AgentConfig, event_tx: tokio::sync::mpsc::UnboundedSender<Value>) {
     let mut backend_url = config.backend_url.clone();
     
     // Convert http/https to ws/wss
@@ -79,7 +79,7 @@ pub async fn start(config: AgentConfig) {
     }
 }
 
-fn handle_message(text: String, config: &AgentConfig) {
+fn handle_message(text: String, config: &AgentConfig, event_tx: &tokio::sync::mpsc::UnboundedSender<Value>) {
     // Engine.IO pong
     if text == "3" {
         return;
@@ -248,9 +248,17 @@ fn handle_message(text: String, config: &AgentConfig) {
                                 } else if action == "PatchSoftware" {
                                     let software_name = params.get("SoftwareName").and_then(|v| v.as_str()).unwrap_or("");
                                     match crate::modules::updater::trigger_patch(software_name) {
-                                        Ok(msg) => println!("[Remediation] Patch:\n{}", msg),
+                                        Ok(msg) => println!("[Remediation] Patch Output:\n{}", msg),
                                         Err(e) => eprintln!("[Remediation] Patch Error:\n{}", e),
                                     }
+                                } else if action == "VulnerabilityReport" || action == "SOARIncident" {
+                                    println!("[WebSocket] Received {} from Backend. Pushing to SDK flow.", action);
+                                    let event = serde_json::json!({
+                                        "event_type": action,
+                                        "severity": "CRITICAL",
+                                        "details": params
+                                    });
+                                    let _ = event_tx.send(event);
                                 } else if action == "TriggerAgentUpdate" {
                                     let download_url = params.get("DownloadUrl").and_then(|v| v.as_str()).unwrap_or("");
                                     let expected_hash = params.get("ExpectedHash").and_then(|v| v.as_str()).unwrap_or("");

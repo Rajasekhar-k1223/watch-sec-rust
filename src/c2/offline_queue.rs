@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use lazy_static::lazy_static;
 
 const QUEUE_FILE: &str = "data/offline_events.jsonl";
-const MAX_QUEUE_SIZE_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
+const MAX_QUEUE_SIZE_BYTES: u64 = 5 * 1024 * 1024; // 5 MB to prevent massive RAM spikes on parse
 
 lazy_static! {
     static ref QUEUE_LOCK: Mutex<()> = Mutex::new(());

@@ -11,7 +11,7 @@ pub fn start(event_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>, li
 
         loop {
             interval.tick().await;
-            sys.refresh_all();
+            sys.refresh_processes();
             
             let blocked_apps = {
                 let lc = live_config.lock().unwrap();

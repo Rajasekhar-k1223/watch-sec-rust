@@ -1,11 +1,67 @@
 use serde::{Serialize, Deserialize};
 use sysinfo::{System, Disks};
 use lazy_static::lazy_static;
-use std::sync::Mutex;
+use std::sync::{Mutex, Arc, RwLock};
+use std::time::Duration;
 
+// ── Single persistent sysinfo instance ───────────────────────────────────────
 lazy_static! {
     static ref GLOBAL_SYS: Mutex<System> = Mutex::new(System::new_all());
 }
+
+// ── Cached CPU/Memory snapshot updated by the background sampler ─────────────
+// All heartbeat and telemetry callers just read this — zero CPU cost per call.
+#[derive(Clone)]
+pub struct CachedStats {
+    pub cpu_usage: f64,
+    pub mem_usage: f64,
+}
+
+lazy_static! {
+    static ref STATS_CACHE: Arc<RwLock<CachedStats>> = Arc::new(RwLock::new(CachedStats {
+        cpu_usage: 0.0,
+        mem_usage: 0.0,
+    }));
+}
+
+/// Start the background CPU/memory sampler. Call once at agent startup.
+/// Samples every 3 seconds in a dedicated thread — keeps STATS_CACHE fresh.
+/// This is the ONLY place that calls refresh_cpu_usage() so there is no
+/// contention or duplicate sampling causing CPU spikes.
+pub fn start_background_sampler() {
+    let cache = Arc::clone(&*STATS_CACHE);
+    std::thread::spawn(move || {
+        loop {
+            // First sample — initialise CPU counters
+            {
+                let mut sys = GLOBAL_SYS.lock().unwrap();
+                sys.refresh_cpu_usage();
+            }
+            // Wait 500ms for accurate delta (sysinfo requirement)
+            std::thread::sleep(Duration::from_millis(500));
+            // Second sample — now CPU% is accurate
+            {
+                let mut sys = GLOBAL_SYS.lock().unwrap();
+                sys.refresh_cpu_usage();
+                sys.refresh_memory();
+
+                let cpu = sys.global_cpu_info().cpu_usage() as f64;
+                let total = sys.total_memory() as f64;
+                let used = sys.used_memory() as f64;
+                let mem = if total > 0.0 { (used / total) * 100.0 } else { 0.0 };
+
+                if let Ok(mut c) = cache.write() {
+                    c.cpu_usage = (cpu * 10.0).round() / 10.0;
+                    c.mem_usage = (mem * 10.0).round() / 10.0;
+                }
+            }
+            // Sleep before next sample cycle — 3 second cadence
+            std::thread::sleep(Duration::from_secs(3));
+        }
+    });
+}
+
+// ── Public structs ───────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "PascalCase")]
@@ -38,54 +94,41 @@ pub struct HardwareStats {
     pub disk_usage: f64,
 }
 
+/// Full hardware stats — reads CPU/memory from the cache (zero extra cost),
+/// but still queries disk info (cheap, no kernel sampling needed).
 pub fn get_hardware_stats() -> HardwareStats {
-    let mut sys = GLOBAL_SYS.lock().unwrap();
-    // First refresh to initialize CPU counters
-    sys.refresh_cpu_usage();
-    // sysinfo requires a short sleep between samples to compute an accurate CPU delta.
-    // Without this, consecutive calls return 0% or stale values.
-    drop(sys); // Release lock during sleep so other threads can run
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    let mut sys = GLOBAL_SYS.lock().unwrap();
-    // Second refresh — now CPU % is accurate
-    sys.refresh_all();
-
-    // CPU Stats
-    let cpus = sys.cpus();
-    let mut cpu_model = "Unknown".to_string();
-    let mut cpu_cores = 0;
-    if !cpus.is_empty() {
-        cpu_model = cpus[0].brand().to_string();
-        cpu_cores = sys.physical_core_count().unwrap_or(cpus.len());
-    }
-    let cpu_threads = cpus.len();
-    let cpu_usage = sys.global_cpu_info().cpu_usage() as f64;
-
-
-    // Memory Stats
-    let total_mem = sys.total_memory() as f64;
-    let used_mem = sys.used_memory() as f64;
-    let available_mem = sys.available_memory() as f64;
-    
-    let gb_div = 1024.0 * 1024.0 * 1024.0;
-    
-    let mem_usage_percent = if total_mem > 0.0 {
-        (used_mem / total_mem) * 100.0
-    } else {
-        0.0
+    // Read cached CPU + memory — never blocks or samples
+    let (cpu_usage, mem_usage_percent) = {
+        let c = STATS_CACHE.read().unwrap();
+        (c.cpu_usage, c.mem_usage)
     };
 
-    // Disk Stats
+    // Read memory details from sysinfo (no refresh needed — sampler keeps it fresh)
+    let (cpu_model, cpu_cores, cpu_threads, total_mem, used_mem, available_mem) = {
+        let sys = GLOBAL_SYS.lock().unwrap();
+        let cpus = sys.cpus();
+        let model = if !cpus.is_empty() { cpus[0].brand().to_string() } else { "Unknown".to_string() };
+        let cores = sys.physical_core_count().unwrap_or(cpus.len());
+        let threads = cpus.len();
+        let total = sys.total_memory() as f64;
+        let used = sys.used_memory() as f64;
+        let avail = sys.available_memory() as f64;
+        (model, cores, threads, total, used, avail)
+    };
+
+    let gb_div = 1024.0 * 1024.0 * 1024.0;
+
+    // Disk Stats — cheap (no kernel sampling)
     let mut disk_total = 0.0;
     let mut disk_free = 0.0;
     let mut disk_usage_percent = 0.0;
-
     let disks = Disks::new_with_refreshed_list();
     for disk in disks.list() {
         disk_total += disk.total_space() as f64;
         disk_free += disk.available_space() as f64;
         if disk_usage_percent == 0.0 && disk.total_space() > 0 {
-            disk_usage_percent = ((disk.total_space() - disk.available_space()) as f64 / disk.total_space() as f64) * 100.0;
+            disk_usage_percent = ((disk.total_space() - disk.available_space()) as f64
+                / disk.total_space() as f64) * 100.0;
         }
     }
 
@@ -114,30 +157,18 @@ pub fn get_hardware_stats() -> HardwareStats {
         disk_usage: disk_usage_percent,
     }
 }
-/// Lightweight stats: only refreshes CPU + memory. Safe to call every 5 seconds.
-/// Does NOT refresh disk, processes, or network — those are expensive.
+
+/// Lightweight stats — reads directly from the background sampler cache.
+/// Zero CPU overhead. Safe to call every second.
 pub struct QuickStats {
     pub cpu_usage: f64,
     pub mem_usage: f64,
 }
 
 pub fn get_quick_stats() -> QuickStats {
-    let mut sys = GLOBAL_SYS.lock().unwrap();
-    // Cheap double-sample for accurate CPU delta
-    sys.refresh_cpu_usage();
-    drop(sys);
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    let mut sys = GLOBAL_SYS.lock().unwrap();
-    sys.refresh_cpu_usage();
-    sys.refresh_memory();
-
-    let cpu_usage = sys.global_cpu_info().cpu_usage() as f64;
-    let total_mem = sys.total_memory() as f64;
-    let used_mem = sys.used_memory() as f64;
-    let mem_usage = if total_mem > 0.0 { (used_mem / total_mem) * 100.0 } else { 0.0 };
-
+    let c = STATS_CACHE.read().unwrap();
     QuickStats {
-        cpu_usage: (cpu_usage * 10.0).round() / 10.0,
-        mem_usage: (mem_usage * 10.0).round() / 10.0,
+        cpu_usage: c.cpu_usage,
+        mem_usage: c.mem_usage,
     }
 }

@@ -70,7 +70,7 @@ macro_rules! agent_log {
     ($($arg:tt)*) => { $crate::log_msg(&format!($($arg)*)) };
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     // CRITICAL: Install rustls crypto provider FIRST before any TLS operations.
     // Required by rustls 0.23+ (pulled in by tokio-tungstenite 0.30).
@@ -202,6 +202,9 @@ async fn main() {
     log_msg(&format!("[Boot] Backend URL: {}", config.backend_url));
     log_msg(&format!("[Boot] Agent ID:    {}", config.agent_id));
     log_msg(&format!("[Boot] Enrolled:    {}", !config.machine_secret.is_empty()));
+
+    log_msg("[Boot] Starting background hardware sampler...");
+    crate::hardware::start_background_sampler();
 
     log_msg("[Boot] Building HTTP client...");
     let client = match Client::builder()
@@ -432,11 +435,15 @@ async fn main() {
     use std::sync::{Arc, Mutex as StdMutex};
     let live_config = Arc::new(StdMutex::new(config.clone()));
 
+    // Event Dispatcher Channel
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+
     // Start Command Receiver (WebSocket)
     if is_primary_agent {
         let c2_config = config.clone();
+        let c2_tx = event_tx.clone();
         tokio::spawn(async move {
-            c2::websocket::start(c2_config).await;
+            c2::websocket::start(c2_config, c2_tx).await;
         });
     }
 
@@ -467,8 +474,7 @@ async fn main() {
         });
     }
 
-    // Event Dispatcher Channel
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    // Event Dispatcher Channel (Moved up)
 
     if is_primary_agent {
         // Start Ransomware Decoy Watcher
@@ -484,7 +490,7 @@ async fn main() {
         #[cfg(target_os = "windows")]
         let fim_paths = vec!["C:\\Windows\\System32\\drivers\\etc", "C:\\ProgramData"];
         #[cfg(not(target_os = "windows"))]
-        let fim_paths = vec!["/etc", "/tmp"];
+        let fim_paths = vec!["/etc"];
         
         modules::fim::start(fim_paths, event_tx.clone());
     }
@@ -502,7 +508,7 @@ async fn main() {
         });
         // Start asynchronous watchdogs
         crate::modules::dlp_engine::start_dlp_monitor(event_tx.clone());
-        crate::modules::webmail_monitor::start_webmail_monitor(event_tx.clone());
+
         crate::modules::usb_monitor::start_usb_monitor(event_tx.clone());
     }
     
@@ -521,7 +527,7 @@ async fn main() {
         tokio::spawn(async move {
             // Screenshot interval is configurable — check live_config each iteration
         let mut last_screenshot = std::time::Instant::now();
-        let mut scan_interval = time::interval(std::time::Duration::from_secs(30)); // Base tick: 30s
+        let mut scan_interval = time::interval(std::time::Duration::from_secs(3600)); // Base tick: 1 hour (was 30s)
         loop {
             scan_interval.tick().await;
             
@@ -680,63 +686,9 @@ async fn main() {
                  upload_machine_secret.clone(), upload_tenant_key.clone())
             };
 
-            // ── Screenshot Upload ─────────────────────────────────────────────
-            // Respects VisualActivityEnabled toggle and configurable interval.
-            let secs_since_last = last_screenshot.elapsed().as_secs();
-            if screenshots_on && secs_since_last >= screenshot_interval {
-                last_screenshot = std::time::Instant::now();
-                if let Some(screenshot_payload) = modules::screenshot_capture::capture_screenshot() {
-                    let mut payload = screenshot_payload.clone();
-                    if let Some(obj) = payload.as_object_mut() {
-                        obj.insert("agent_id".to_string(), serde_json::json!(agent_id));
-                        obj.remove("_EventType");
-                    }
-                    let url = format!("{}/api/screenshots/upload", backend_url);
-                    let body_str = serde_json::to_string(&payload).unwrap_or_default();
-                    let ts = chrono::Utc::now().timestamp().to_string();
-                    let sig = crate::api::generate_signature(&machine_secret, &body_str, &ts);
-                    let _ = upload_client.post(&url)
-                        .header("Content-Type", "application/json")
-                        .header("X-Signature", sig)
-                        .header("X-Timestamp", ts)
-                        .header("X-Tenant-Api-Key", &tenant_key)
-                        .body(body_str)
-                        .send()
-                        .await;
-                    crate::log_msg("[Screenshot] Uploaded to backend.");
-                }
-            }
-
-            // ── Clipboard Audit → REST Upload ─────────────────────────────────
-            // ClipboardAuditEnabled gate; sends to /api/events/report (not gRPC)
-            if clipboard_audit_on {
-                let clipboard = modules::clipboard_audit::audit_clipboard();
-                if let Some(contents) = clipboard.get("ClipboardContents").and_then(|v| v.as_str()) {
-                    if !contents.is_empty() && contents != "[Clipboard is empty]" {
-                        let payload = serde_json::json!({
-                            "Type":      "ClipboardCapture",
-                            "AgentId":  agent_id,
-                            "Details":   contents,
-                            "Timestamp": chrono::Utc::now().to_rfc3339(),
-                        });
-                        let url = format!("{}/api/events/report", backend_url);
-                        let body_str = serde_json::to_string(&payload).unwrap_or_default();
-                        let ts = chrono::Utc::now().timestamp().to_string();
-                        let sig = crate::api::generate_signature(&machine_secret, &body_str, &ts);
-                        let _ = upload_client.post(&url)
-                            .header("Content-Type", "application/json")
-                            .header("X-Signature", sig)
-                            .header("X-Timestamp", ts)
-                            .body(body_str)
-                            .send()
-                            .await;
-                    }
-                }
-            } else {
-                // Still capture for internal event bus even when upload disabled
-                let clipboard = modules::clipboard_audit::audit_clipboard();
-                let _ = security_tx.send(clipboard);
-            }
+            // Capture for internal event bus even when upload disabled
+            let clipboard = modules::clipboard_audit::audit_clipboard();
+            let _ = security_tx.send(clipboard);
 
             let location = modules::location_tracking::track_location();
             let _ = security_tx.send(location);
@@ -881,7 +833,8 @@ async fn main() {
 
             // ── Mail Intelligence ─────────────────────────────────────────────
             if mail_on {
-                let mail_events = modules::mail_monitor::capture_mail_events();
+                let mut mail_events = modules::mail_monitor::capture_mail_events();
+                mail_events.extend(modules::webmail_monitor::capture_webmail_events());
                 for evt in mail_events {
                     let mail_url = format!("{}/api/mail/", backend_url);
                     let mut payload = evt.clone();
@@ -925,6 +878,14 @@ async fn main() {
         loop {
             tokio::select! {
                 Some(event) = event_rx.recv() => {
+                    // Check if this is a push-down from the backend (WebSocket)
+                    if let Some(ev_type) = event.get("event_type").and_then(|t| t.as_str()) {
+                        if ev_type == "VulnerabilityReport" || ev_type == "SOARIncident" {
+                            let _ = sdk_tx.send(event.clone()); // Broadcast to Local SDK
+                            continue; // DO NOT send back to gRPC (prevents loops)
+                        }
+                    }
+
                     // Enrich event with MITRE ATT&CK Context
                     let enriched_event = crate::engines::mitre_mapper::enrich_event(event);
                     
@@ -979,7 +940,91 @@ async fn main() {
             }
         }
     });
-    }
+    } // End of is_primary_agent block
+
+    // --- USER SESSION LOOP ---
+    // Start this loop unconditionally so that User Session agents can capture screenshots and clipboard.
+    let user_live_config = Arc::clone(&live_config);
+    let user_upload_client = client.clone();
+    tokio::spawn(async move {
+        let mut last_screenshot = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(3600)).unwrap_or_else(std::time::Instant::now);
+        let mut last_clipboard = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(3600)).unwrap_or_else(std::time::Instant::now);
+        let mut scan_interval = time::interval(std::time::Duration::from_secs(5));
+        loop {
+            scan_interval.tick().await;
+
+            let (screenshots_on, screenshot_interval, clipboard_audit_on,
+                 agent_id, backend_url, machine_secret, tenant_key) = {
+                let lc = user_live_config.lock().unwrap();
+                (lc.screenshots_enabled, lc.screenshot_interval, lc.clipboard_audit_enabled,
+                 lc.agent_id.clone(), lc.backend_url.clone(), lc.machine_secret.clone(), lc.tenant_api_key.clone())
+            };
+
+            // ── Screenshot Upload ──
+            let secs_since_last = last_screenshot.elapsed().as_secs();
+            if screenshots_on && secs_since_last >= screenshot_interval {
+                last_screenshot = std::time::Instant::now();
+                if let Some(screenshot_payload) = crate::modules::screenshot_capture::capture_screenshot() {
+                    let mut payload = screenshot_payload.clone();
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert("agent_id".to_string(), serde_json::json!(agent_id));
+                        obj.remove("_EventType");
+                    }
+                    let url = format!("{}/api/screenshots/upload", backend_url);
+                    let body_str = serde_json::to_string(&payload).unwrap_or_default();
+                    let ts = chrono::Utc::now().timestamp().to_string();
+                    let sig = crate::api::generate_signature(&machine_secret, &body_str, &ts);
+                    
+                    let client_clone = user_upload_client.clone();
+                    let tenant_key_clone = tenant_key.clone();
+                    tokio::spawn(async move {
+                        let _ = client_clone.post(&url)
+                            .header("Content-Type", "application/json")
+                            .header("X-Signature", sig)
+                            .header("X-Timestamp", ts)
+                            .header("X-Tenant-Api-Key", &tenant_key_clone)
+                            .body(body_str)
+                            .send()
+                            .await;
+                        crate::log_msg("[Screenshot] Uploaded to backend.");
+                    });
+                }
+            }
+
+            // ── Clipboard Audit ──
+            let secs_since_last_clipboard = last_clipboard.elapsed().as_secs();
+            // Default to 60s clipboard audit to save CPU from powershell spawns
+            if clipboard_audit_on && secs_since_last_clipboard >= 60 {
+                last_clipboard = std::time::Instant::now();
+                let clipboard = crate::modules::clipboard_audit::audit_clipboard();
+                if let Some(contents) = clipboard.get("ClipboardContents").and_then(|v| v.as_str()) {
+                    if !contents.is_empty() && contents != "[Clipboard is empty]" {
+                        let payload = serde_json::json!({
+                            "Type":      "ClipboardCapture",
+                            "AgentId":  agent_id,
+                            "Details":   contents,
+                            "Timestamp": chrono::Utc::now().to_rfc3339(),
+                        });
+                        let url = format!("{}/api/events/report", backend_url);
+                        let body_str = serde_json::to_string(&payload).unwrap_or_default();
+                        let ts = chrono::Utc::now().timestamp().to_string();
+                        let sig = crate::api::generate_signature(&machine_secret, &body_str, &ts);
+                        
+                        let client_clone = user_upload_client.clone();
+                        tokio::spawn(async move {
+                            let _ = client_clone.post(&url)
+                                .header("Content-Type", "application/json")
+                                .header("X-Signature", sig)
+                                .header("X-Timestamp", ts)
+                                .body(body_str)
+                                .send()
+                                .await;
+                        });
+                    }
+                }
+            }
+        }
+    });
 
     let mut interval = time::interval(Duration::from_secs(30)); // Full heartbeat every 30s — expensive sysinfo refresh_all
 

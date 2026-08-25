@@ -30,7 +30,7 @@ pub fn get_power_status() -> Value {
 
     #[cfg(target_os = "windows")]
     {
-        if let Ok(out) = std::process::Command::new("wmic").args(&["path", "Win32_Battery", "get", "EstimatedChargeRemaining,BatteryStatus"]).output() {
+        if let Ok(out) = crate::hidden_command!("wmic").args(&["path", "Win32_Battery", "get", "EstimatedChargeRemaining,BatteryStatus"]).output() {
             let out_str = String::from_utf8_lossy(&out.stdout);
             let lines: Vec<&str> = out_str.lines().filter(|l| !l.trim().is_empty()).collect();
             if lines.len() > 1 {

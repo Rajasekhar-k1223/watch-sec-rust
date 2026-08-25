@@ -49,7 +49,7 @@ pub fn simulate_input(data: &Value) {
 
 pub fn lock_workstation() {
     #[cfg(target_os = "windows")]
-    let _ = Command::new("rundll32.exe").arg("user32.dll,LockWorkStation").spawn();
+    let _ = crate::hidden_command!("rundll32.exe").arg("user32.dll,LockWorkStation").spawn();
 
     #[cfg(target_os = "linux")]
     let _ = Command::new("xdg-screensaver").arg("lock").spawn();
@@ -80,7 +80,7 @@ pub fn toggle_curtain_mode(enable: bool) {
             [Win32]::BlockInput($true)
             [Win32]::SendMessage($HWND_BROADCAST, $WM_SYSCOMMAND, [IntPtr]$SC_MONITORPOWER, [IntPtr]$POWER_OFF)
             "#;
-            let _ = Command::new("powershell").args(&["-Command", script]).spawn();
+            let _ = crate::hidden_command!("powershell").args(&["-Command", script]).spawn();
         } else {
             let script = r#"
             Add-Type -TypeDefinition '
@@ -93,7 +93,7 @@ pub fn toggle_curtain_mode(enable: bool) {
             '
             [Win32]::BlockInput($false)
             "#;
-            let _ = Command::new("powershell").args(&["-Command", script]).spawn();
+            let _ = crate::hidden_command!("powershell").args(&["-Command", script]).spawn();
         }
     }
 

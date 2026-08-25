@@ -156,7 +156,7 @@ pub async fn send_heartbeat(client: &Client, config: &AgentConfig) -> Result<Age
         user_login_time,
         version: format!("v{}", env!("CARGO_PKG_VERSION")),
         hardware: stats.hw_info,
-        machine_secret,
+        machine_secret: machine_secret.clone(),
         power_status: crate::modules::power_monitor::get_power_status(),
     };
 
@@ -184,6 +184,8 @@ pub async fn send_heartbeat(client: &Client, config: &AgentConfig) -> Result<Age
         .await?;
 
     let mut updated_config = config.clone();
+    // CRITICAL: Save the generated machine_secret back to config so background tasks (like screenshots) use it!
+    updated_config.machine_secret = machine_secret.clone();
 
     if res.status().is_success() {
         crate::log_msg("[Heartbeat] Successfully sent heartbeat.");
@@ -228,7 +230,7 @@ pub async fn send_heartbeat(client: &Client, config: &AgentConfig) -> Result<Age
                     updated_config.dlp_enabled             = bool_field("FileDlpEnabled",              Some("DataLossPreventionEnabled"));
 
                     // Settings
-                    updated_config.screenshot_interval     = u64_field("ScreenshotInterval", 300).max(30);
+                    updated_config.screenshot_interval     = u64_field("ScreenshotInterval", 300).max(5);
                     updated_config.screenshot_quality      = u64_field("ScreenshotQuality",  80).min(100) as u32;
                     updated_config.shadow_paths            = str_vec_field("ShadowPaths");
                     updated_config.blocked_apps            = str_vec_field("BlockedApps");

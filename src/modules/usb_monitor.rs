@@ -65,7 +65,7 @@ pub fn start_usb_monitor(event_tx: tokio::sync::mpsc::UnboundedSender<serde_json
         let mut known_usbs: std::collections::HashSet<String> = std::collections::HashSet::new();
         
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_secs(60));
             let usbs = get_connected_usbs();
             
             for usb in usbs {

@@ -6,7 +6,7 @@ use serde::{Serialize, Deserialize};
 use lazy_static::lazy_static;
 
 const REST_QUEUE_FILE: &str = "data/offline_rest.jsonl";
-const MAX_QUEUE_SIZE_BYTES: u64 = 500 * 1024 * 1024; // 500 MB for files/images
+const MAX_QUEUE_SIZE_BYTES: u64 = 15 * 1024 * 1024; // 15 MB to prevent massive RAM spikes on parse
 
 lazy_static! {
     static ref REST_QUEUE_LOCK: Mutex<()> = Mutex::new(());

@@ -36,7 +36,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         AgentConfig {
-            backend_url:             "https://agent-api.monitorix.co.in".to_string(),
+            backend_url:             "https://agent-apis.elsea.co.in".to_string(),
             agent_id:                "agent-rust-dev".to_string(),
             tenant_api_key:          "dev-key".to_string(),
             machine_secret:          "".to_string(),
