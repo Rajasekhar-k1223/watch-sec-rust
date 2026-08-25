@@ -32,7 +32,7 @@ pub fn get_installed_software() -> String {
         let output = crate::hidden_command!("powershell")
             .arg("-NoProfile")
             .arg("-Command")
-            .arg("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; try { @(Get-ItemProperty HKLM:\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*, HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* -ErrorAction SilentlyContinue | Select-Object DisplayName, DisplayVersion | Where-Object { $_.DisplayName -ne $null }) | ConvertTo-Json -Compress } catch { '[]' }")
+            .arg("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; try { @(Get-ItemProperty HKLM:\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*, HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*, HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -ne $null -and $_.SystemComponent -ne 1 -and $_.ParentKeyName -eq $null } | Select-Object DisplayName, DisplayVersion) | ConvertTo-Json -Compress } catch { '[]' }")
             .output();
 
         if let Ok(output) = output {
