@@ -527,7 +527,8 @@ async fn main() {
         tokio::spawn(async move {
             // Screenshot interval is configurable — check live_config each iteration
         let mut last_screenshot = std::time::Instant::now();
-        let mut scan_interval = time::interval(std::time::Duration::from_secs(3600)); // Base tick: 1 hour (was 30s)
+        // [FIX] Reduced security scan interval from 1 hour to 5 minutes so vulnerabilities are detected quickly!
+        let mut scan_interval = time::interval(std::time::Duration::from_secs(300)); 
         loop {
             scan_interval.tick().await;
             
