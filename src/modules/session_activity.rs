@@ -18,19 +18,34 @@ pub async fn get_active_window() -> Option<serde_json::Value> {
 
     #[cfg(unix)]
     {
-        // Try to use xdotool if available
+        // Try to use xdotool if available (Linux X11)
         if let Ok(Ok(output)) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             tokio::process::Command::new("xdotool").arg("getactivewindow").arg("getwindowname").output()
         ).await {
             window_title = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            process_name = "Unknown(Linux)".to_string();
         }
-        process_name = "Unknown(Linux)".to_string();
         
-        // If xdotool fails and we're in dev, just simulate some activity for demonstration
-        if window_title.is_empty() {
-            window_title = "Development IDE - monitorix".to_string();
-            process_name = "code".to_string();
+        // For macOS, xdotool isn't standard. Use osascript to get the active app.
+        if cfg!(target_os = "macos") && window_title.is_empty() {
+            if let Ok(Ok(output)) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::process::Command::new("osascript")
+                    .arg("-e")
+                    .arg("tell application \"System Events\" to get name of first application process whose frontmost is true")
+                    .output()
+            ).await {
+                window_title = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                process_name = window_title.clone();
+            }
+        }
+
+        // Check for Linux/Mac Lock Screens
+        let lower_title = window_title.to_lowercase();
+        if lower_title.contains("lock") || lower_title.contains("screensaver") || lower_title == "loginwindow" {
+            // Force empty so it triggers the "System Idle" logic below
+            window_title = String::new();
         }
     }
 
