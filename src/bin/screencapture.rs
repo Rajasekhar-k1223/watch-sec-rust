@@ -9,17 +9,17 @@ use image::ImageBuffer;
 fn main() {
     unsafe {
         let hwnd = GetDesktopWindow();
-        let hdc_screen = GetDC(Some(hwnd));
-        let hdc_mem = CreateCompatibleDC(Some(hdc_screen));
+        let hdc_screen = GetDC(hwnd);
+        let hdc_mem = CreateCompatibleDC(hdc_screen);
 
         let width = GetSystemMetrics(SM_CXSCREEN);
         let height = GetSystemMetrics(SM_CYSCREEN);
 
         let hbm = CreateCompatibleBitmap(hdc_screen, width, height);
-        let h_old = SelectObject(hdc_mem, hbm.into());
+        let h_old = SelectObject(hdc_mem, hbm);
 
         // Copy screen to memory DC
-        let _ = BitBlt(hdc_mem, 0, 0, width, height, Some(hdc_screen), 0, 0, SRCCOPY);
+        let _ = BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, 0, 0, SRCCOPY);
 
         // Get bitmap bits
         let mut bmi: BITMAPINFO = std::mem::zeroed();
@@ -44,9 +44,9 @@ fn main() {
 
         // Cleanup GDI
         SelectObject(hdc_mem, h_old);
-        let _ = DeleteObject(hbm.into());
+        let _ = DeleteObject(hbm);
         let _ = DeleteDC(hdc_mem);
-        let _ = ReleaseDC(Some(hwnd), hdc_screen);
+        let _ = ReleaseDC(hwnd, hdc_screen);
 
         // Convert BGRA to RGBA for image crate
         for chunk in buffer.chunks_exact_mut(4) {

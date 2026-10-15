@@ -17,7 +17,7 @@ pub fn get_power_status() -> Value {
     
     #[cfg(target_os = "macos")]
     {
-        if let Ok(out) = std::process::Command::new("pmset").arg("-g").arg("batt").output() {
+        if let Ok(out) = crate::hidden_command!("pmset").arg("-g").arg("batt").output() {
             let out_str = String::from_utf8_lossy(&out.stdout);
             if out_str.contains("Battery") || out_str.contains("InternalBattery") {
                 if let Some(p) = out_str.split('%').next().and_then(|s| s.split_whitespace().last()) {
@@ -30,16 +30,44 @@ pub fn get_power_status() -> Value {
 
     #[cfg(target_os = "windows")]
     {
-        if let Ok(out) = crate::hidden_command!("wmic").args(&["path", "Win32_Battery", "get", "EstimatedChargeRemaining,BatteryStatus"]).output() {
-            let out_str = String::from_utf8_lossy(&out.stdout);
-            let lines: Vec<&str> = out_str.lines().filter(|l| !l.trim().is_empty()).collect();
-            if lines.len() > 1 {
-                let parts: Vec<&str> = lines[1].split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(status) = parts[0].parse::<u32>() {
-                        plugged = status == 2; // 2 = AC
+        use wmi::{COMLibrary, WMIConnection};
+        use serde::Deserialize;
+        use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "PascalCase")]
+        struct Win32Battery {
+            pub estimated_charge_remaining: Option<u16>,
+            pub battery_status: Option<u16>,
+        }
+
+        let mut wmi_success = false;
+
+        if let Ok(com_con) = COMLibrary::new() {
+            if let Ok(wmi_con) = WMIConnection::new(com_con.into()) {
+                if let Ok(results) = wmi_con.raw_query::<Win32Battery>("SELECT EstimatedChargeRemaining, BatteryStatus FROM Win32_Battery") {
+                    if let Some(battery) = results.first() {
+                        if let Some(status) = battery.battery_status {
+                            plugged = status == 2; // 2 = AC
+                        }
+                        if let Some(charge) = battery.estimated_charge_remaining {
+                            percent = charge as i32;
+                        }
+                        wmi_success = true;
                     }
-                    percent = parts[1].parse().unwrap_or(100);
+                }
+            }
+        }
+
+        if !wmi_success {
+            // WMI Failed (Service disabled or errored out). Fallback to Win32 API.
+            unsafe {
+                let mut status = SYSTEM_POWER_STATUS::default();
+                if GetSystemPowerStatus(&mut status).is_ok() {
+                    if status.BatteryLifePercent != 255 {
+                        percent = status.BatteryLifePercent as i32;
+                    }
+                    plugged = status.ACLineStatus == 1;
                 }
             }
         }

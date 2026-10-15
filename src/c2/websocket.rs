@@ -124,6 +124,16 @@ fn handle_message(text: String, config: &AgentConfig, event_tx: &tokio::sync::mp
                             if event_name == "RemoteInput" {
                                 let value = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
                                 crate::modules::input_simulation::simulate_input(&value);
+                            } else if event_name == "StartStream" {
+                                match crate::modules::live_desktop::start_live_desktop(config.agent_id.clone()) {
+                                    Ok(msg) => println!("[StartStream] {}", msg),
+                                    Err(e) => eprintln!("[StartStream] Error: {}", e),
+                                }
+                            } else if event_name == "StopStream" {
+                                match crate::modules::live_desktop::stop_live_desktop() {
+                                    Ok(msg) => println!("[StopStream] {}", msg),
+                                    Err(e) => eprintln!("[StopStream] Error: {}", e),
+                                }
                             } else if event_name == "Remediation" {
                                 let action = params.get("Action").and_then(|v| v.as_str()).unwrap_or("");
                                 if action == "KillProcess" {
@@ -145,6 +155,26 @@ fn handle_message(text: String, config: &AgentConfig, event_tx: &tokio::sync::mp
                                         Ok(msg) => println!("[Remediation] Script Output:\n{}", msg),
                                         Err(e) => eprintln!("[Remediation] Script Error:\n{}", e),
                                     }
+                                } else if action == "SinkholeDNS" {
+                                    if let Some(domains_val) = params.get("Domains").and_then(|v| v.as_array()) {
+                                        let mut domains = Vec::new();
+                                        for d in domains_val {
+                                            if let Some(s) = d.as_str() {
+                                                domains.push(s.to_string());
+                                            }
+                                        }
+                                        match crate::modules::dns_monitor::sinkhole_domains(domains) {
+                                            Ok(msg) => println!("[Remediation] DNS Sinkhole:\n{}", msg),
+                                            Err(e) => eprintln!("[Remediation] DNS Sinkhole Error:\n{}", e),
+                                        }
+                                    }
+                                } else if action == "DeployDeception" {
+                                    crate::modules::deception::deploy_honeyfiles(&config.agent_id);
+                                    let agent_id_clone = config.agent_id.clone();
+                                    tokio::spawn(async move {
+                                        crate::modules::deception::deploy_shadow_service(agent_id_clone).await;
+                                    });
+                                    println!("[Remediation] Deception engine deployed.");
                                 } else if action == "ManageService" {
                                     let svc_name = params.get("ServiceName").and_then(|v| v.as_str()).unwrap_or("");
                                     let svc_action = params.get("ServiceAction").and_then(|v| v.as_str()).unwrap_or("");
@@ -156,6 +186,19 @@ fn handle_message(text: String, config: &AgentConfig, event_tx: &tokio::sync::mp
                                     match crate::modules::lockdown::lock_session() {
                                         Ok(msg) => println!("[Remediation] Lockdown:\n{}", msg),
                                         Err(e) => eprintln!("[Remediation] Lockdown Error:\n{}", e),
+                                    }
+                                } else if action == "StartPcap" {
+                                    match crate::modules::pcap_engine::start_capture() {
+                                        Ok(msg) => println!("[Remediation] PCAP:\n{}", msg),
+                                        Err(e) => eprintln!("[Remediation] PCAP Error:\n{}", e),
+                                    }
+                                } else if action == "StopPcap" {
+                                    match crate::modules::pcap_engine::stop_and_collect() {
+                                        Ok(msg) => {
+                                            println!("[Remediation] PCAP collected, queueing upload.");
+                                            crate::c2::offline_queue::enqueue_event(&msg);
+                                        },
+                                        Err(e) => eprintln!("[Remediation] PCAP Error:\n{}", e),
                                     }
                                 } else if action == "TriggerIOCScan" {
                                     let dir = params.get("TargetDirectory").and_then(|v| v.as_str()).unwrap_or("/").to_string();
@@ -235,7 +278,10 @@ fn handle_message(text: String, config: &AgentConfig, event_tx: &tokio::sync::mp
                                     }).unwrap_or_default();
                                     let output_dir = params.get("OutputDirectory").and_then(|v| v.as_str()).unwrap_or("/tmp/monitorix_dumps");
                                     match crate::modules::memory_dump::trigger_memory_dump(&pid, output_dir) {
-                                        Ok(msg) => println!("[Remediation] Memory Dump Output:\n{}", msg),
+                                        Ok(msg) => {
+                                            println!("[Remediation] Memory Dump Generated: {}", msg["Message"]);
+                                            crate::c2::offline_queue::enqueue_event(&msg);
+                                        },
                                         Err(e) => eprintln!("[Remediation] Memory Dump Error:\n{}", e),
                                     }
                                 } else if action == "TriggerYaraScan" {
@@ -263,9 +309,18 @@ fn handle_message(text: String, config: &AgentConfig, event_tx: &tokio::sync::mp
                                     let download_url = params.get("DownloadUrl").and_then(|v| v.as_str()).unwrap_or("");
                                     let expected_hash = params.get("ExpectedHash").and_then(|v| v.as_str()).unwrap_or("");
                                     let publisher_signature = params.get("PublisherSignature").and_then(|v| v.as_str()).unwrap_or("");
-                                    match crate::modules::updater::trigger_update(download_url, expected_hash, publisher_signature) {
+                                    let progress_cb = Box::new(|percent: u64| {
+                                        println!("[Updater] WebSocket trigger download progress: {}%", percent);
+                                    });
+                                    match crate::modules::updater::trigger_update(download_url, expected_hash, publisher_signature, progress_cb) {
                                         Ok(msg) => println!("[Remediation] Updater:\n{}", msg),
                                         Err(e) => eprintln!("[Remediation] Updater Error:\n{}", e),
+                                    }
+                                } else if action == "RollbackVersion" || action == "TriggerAgentRollback" || action == "AgentRollback" {
+                                    let target_ver = params.get("TargetVersion").and_then(|v| v.as_str());
+                                    match crate::modules::rollback::rollback_agent_binary(target_ver) {
+                                        Ok(msg) => println!("[Remediation] Rollback Success:\n{}", msg),
+                                        Err(e) => eprintln!("[Remediation] Rollback Error:\n{}", e),
                                     }
                                 } else if action == "UploadFile" {
                                     let path = params.get("DestinationPath").and_then(|v| v.as_str()).unwrap_or("");
@@ -314,16 +369,6 @@ fn handle_message(text: String, config: &AgentConfig, event_tx: &tokio::sync::mp
                                     match crate::modules::peripheral_control::block_microphone() {
                                         Ok(msg) => println!("[Remediation] Peripheral Control:\n{}", msg),
                                         Err(e) => eprintln!("[Remediation] Peripheral Control Error:\n{}", e),
-                                    }
-                                } else if action == "StartLiveDesktop" {
-                                    match crate::modules::live_desktop::start_live_desktop(config.agent_id.clone()) {
-                                        Ok(msg) => println!("[Remediation] Live Desktop:\n{}", msg),
-                                        Err(e) => eprintln!("[Remediation] Live Desktop Error:\n{}", e),
-                                    }
-                                } else if action == "StopLiveDesktop" {
-                                    match crate::modules::live_desktop::stop_live_desktop() {
-                                        Ok(msg) => println!("[Remediation] Live Desktop:\n{}", msg),
-                                        Err(e) => eprintln!("[Remediation] Live Desktop Error:\n{}", e),
                                     }
                                 } else if action == "EditRegistry" {
                                     let path = params.get("RegistryPath").and_then(|v| v.as_str()).unwrap_or("");

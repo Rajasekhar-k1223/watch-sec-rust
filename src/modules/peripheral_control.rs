@@ -78,29 +78,27 @@ pub fn audit_audio_monitoring() -> serde_json::Value {
 
     #[cfg(target_os = "windows")]
     {
-        let ps_script = r#"
-$path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone'
-if (Test-Path $path) {
-    $keys = Get-ChildItem $path
-    foreach ($k in $keys) {
-        $val = Get-ItemProperty -Path $k.PSPath -Name "LastUsedTimeStop" -ErrorAction SilentlyContinue
-        if ($null -ne $val -and $val.LastUsedTimeStop -eq 0) {
-            Write-Output "ACTIVE"
-            exit
-        }
-    }
-}
-Write-Output "INACTIVE"
-"#;
-        if let Ok(output) = crate::hidden_command!("powershell")
-            .args(&["-NoProfile", "-Command", ps_script])
-            .output()
-        {
-            if String::from_utf8_lossy(&output.stdout).trim() == "ACTIVE" {
-                is_active = true;
+        use winreg::enums::*;
+        use winreg::RegKey;
+
+        is_active = false;
+        if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(
+            "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\microphone",
+            KEY_READ
+        ) {
+            for key_name_res in hkcu.enum_keys().map(|x| x.unwrap_or_default()) {
+                if key_name_res.is_empty() { continue; }
+                if let Ok(app_key) = hkcu.open_subkey_with_flags(&key_name_res, KEY_READ) {
+                    if let Ok(stop_time) = app_key.get_value::<u64, _>("LastUsedTimeStop") {
+                        if stop_time == 0 {
+                            is_active = true;
+                            break;
+                        }
+                    }
+                }
             }
-            details = "Checked via CapabilityAccessManager registry".to_string();
         }
+        details = "Checked via CapabilityAccessManager registry natively".to_string();
     }
 
     if details.is_empty() {

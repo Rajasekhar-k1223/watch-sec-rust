@@ -137,7 +137,7 @@ fn do_capture() -> bool { false }
 
 const B64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-fn base64_encode(input: &[u8]) -> String {
+pub fn base64_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(((input.len() + 2) / 3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;

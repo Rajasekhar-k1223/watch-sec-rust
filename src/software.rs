@@ -9,6 +9,8 @@ pub struct InstalledSoftware {
     pub name: String,
     pub version: String,
     pub install_date: Option<String>,
+    pub file_version: Option<String>,
+    pub product_version: Option<String>,
 }
 
 lazy_static! {
@@ -33,6 +35,46 @@ pub fn get_installed_software() -> String {
     {
         use winreg::enums::*;
         use winreg::RegKey;
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO};
+
+        fn get_file_version_info(path: &str) -> Option<(String, String)> {
+            let path_wide: Vec<u16> = std::ffi::OsStr::new(path).encode_wide().chain(std::iter::once(0)).collect();
+            let pcwstr = PCWSTR(path_wide.as_ptr());
+            
+            unsafe {
+                let mut handle = 0;
+                let size = GetFileVersionInfoSizeW(pcwstr, Some(&mut handle));
+                if size == 0 { return None; }
+                
+                let mut buffer: Vec<u8> = vec![0; size as usize];
+                if GetFileVersionInfoW(pcwstr, handle, size, buffer.as_mut_ptr() as *mut _).is_err() {
+                    return None;
+                }
+                
+                let mut ptr = std::ptr::null_mut();
+                let mut len = 0;
+                let sub_block: Vec<u16> = std::ffi::OsStr::new("\\").encode_wide().chain(std::iter::once(0)).collect();
+                let sub_pcwstr = PCWSTR(sub_block.as_ptr());
+                
+                if VerQueryValueW(buffer.as_ptr() as *const _, sub_pcwstr, &mut ptr, &mut len).as_bool() {
+                    if len as usize >= std::mem::size_of::<VS_FIXEDFILEINFO>() {
+                        let info = &*(ptr as *const VS_FIXEDFILEINFO);
+                        let file_version = format!("{}.{}.{}.{}", 
+                            (info.dwFileVersionMS >> 16) & 0xffff, info.dwFileVersionMS & 0xffff,
+                            (info.dwFileVersionLS >> 16) & 0xffff, info.dwFileVersionLS & 0xffff
+                        );
+                        let prod_version = format!("{}.{}.{}.{}", 
+                            (info.dwProductVersionMS >> 16) & 0xffff, info.dwProductVersionMS & 0xffff,
+                            (info.dwProductVersionLS >> 16) & 0xffff, info.dwProductVersionLS & 0xffff
+                        );
+                        return Some((file_version, prod_version));
+                    }
+                }
+            }
+            None
+        }
 
         let paths = vec![
             (RegKey::predef(HKEY_LOCAL_MACHINE), "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
@@ -57,11 +99,47 @@ pub fn get_installed_software() -> String {
                         }
                         
                         if let Ok(name) = app_key.get_value::<String, _>("DisplayName") {
-                            let version = app_key.get_value::<String, _>("DisplayVersion").unwrap_or_default();
+                            let mut version = app_key.get_value::<String, _>("DisplayVersion").unwrap_or_default();
+                            
+                            let mut exe_path = String::new();
+                            if let Ok(icon) = app_key.get_value::<String, _>("DisplayIcon") {
+                                exe_path = icon.split(',').next().unwrap_or("").trim_matches('"').to_string();
+                            }
+                            if exe_path.is_empty() || !exe_path.to_lowercase().ends_with(".exe") {
+                                if let Ok(uninstall) = app_key.get_value::<String, _>("UninstallString") {
+                                    let un = uninstall.split(" /").next().unwrap_or("").trim_matches('"').to_string();
+                                    if un.to_lowercase().ends_with(".exe") {
+                                        exe_path = un;
+                                    }
+                                }
+                            }
+                            
+                            let mut file_version = None;
+                            let mut product_version = None;
+
+                            if !exe_path.is_empty() {
+                                if let Some((fv, pv)) = get_file_version_info(&exe_path) {
+                                    file_version = Some(fv.clone());
+                                    product_version = Some(pv.clone());
+                                    // [NEW] Dynamically prefer ProductVersion over registry string
+                                    if !pv.is_empty() {
+                                        version = pv;
+                                    } else if !fv.is_empty() {
+                                        version = fv;
+                                    }
+                                }
+                            }
+                                
+                            if version.is_empty() {
+                                version = "Unknown".to_string();
+                            }
+
                             software_list.push(InstalledSoftware {
                                 name,
                                 version,
                                 install_date: None,
+                                file_version,
+                                product_version,
                             });
                         }
                     }
@@ -88,6 +166,8 @@ pub fn get_installed_software() -> String {
                             name: parts[0].to_string(),
                             version: parts[1].to_string(),
                             install_date: None,
+                            file_version: None,
+                            product_version: None,
                         });
                     }
                 }

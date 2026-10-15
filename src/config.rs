@@ -25,12 +25,17 @@ pub struct AgentConfig {
     #[serde(skip)] pub voice_enabled:           bool,   // VoiceIntelligenceEnabled
     #[serde(skip)] pub network_audit_enabled:   bool,   // NetworkAuditEnabled
     #[serde(skip)] pub dlp_enabled:             bool,   // DataLossPreventionEnabled
+    #[serde(skip)] pub vulnerability_intelligence_enabled: bool, // VulnerabilityIntelligenceEnabled
+    #[serde(skip)] pub sandbox_enabled:         bool,   // SandboxEnabled / RedRainbowEnabled
 
     // ── Runtime settings (from heartbeat response) ────────────────────────────
     #[serde(skip)] pub screenshot_interval:     u64,    // ScreenshotInterval (seconds)
     #[serde(skip)] pub screenshot_quality:      u32,    // ScreenshotQuality (0-100)
     #[serde(skip)] pub shadow_paths:            Vec<String>, // ShadowPaths
     #[serde(skip)] pub blocked_apps:            Vec<String>, // BlockedApps
+    #[serde(skip)] pub fim_enabled:             bool,
+    #[serde(skip)] pub fim_paths:               Vec<String>,
+    #[serde(skip)] pub deception_enabled:        bool,   // DeceptionEnabled — deploy honeyfiles
 }
 
 impl Default for AgentConfig {
@@ -50,11 +55,16 @@ impl Default for AgentConfig {
             voice_enabled:           false,
             network_audit_enabled:   false,
             dlp_enabled:             false,
+            vulnerability_intelligence_enabled: false,
+            sandbox_enabled:         false,
             // Settings
             screenshot_interval:     300,
             screenshot_quality:      80,
             shadow_paths:            Vec::new(),
             blocked_apps:            Vec::new(),
+            fim_enabled:             false,
+            fim_paths:               Vec::new(),
+            deception_enabled:       false,
         }
     }
 }

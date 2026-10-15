@@ -20,14 +20,14 @@ pub fn isolate_network(backend_ip: &str) -> Result<String, String> {
     #[cfg(windows)]
     {
         println!("[Lockdown] Enforcing Windows Firewall microsegmentation drop rules...");
-        let _ = crate::hidden_command!("powershell")
-            .args(["-Command", "New-NetFirewallRule -DisplayName 'Monitorix Lockdown Block All Outbound' -Direction Outbound -Action Block -Profile Any"])
+        let _ = crate::hidden_command!("netsh")
+            .args(["advfirewall", "firewall", "add", "rule", "name=Monitorix Lockdown Block All Outbound", "dir=out", "action=block", "profile=any"])
             .output();
-        let _ = crate::hidden_command!("powershell")
-            .args(["-Command", "New-NetFirewallRule -DisplayName 'Monitorix Lockdown Block All Inbound' -Direction Inbound -Action Block -Profile Any"])
+        let _ = crate::hidden_command!("netsh")
+            .args(["advfirewall", "firewall", "add", "rule", "name=Monitorix Lockdown Block All Inbound", "dir=in", "action=block", "profile=any"])
             .output();
-        let _ = crate::hidden_command!("powershell")
-            .args(["-Command", &format!("New-NetFirewallRule -DisplayName 'Monitorix Allow C2' -Direction Outbound -RemoteAddress '{}' -Action Allow", backend_ip)])
+        let _ = crate::hidden_command!("netsh")
+            .args(["advfirewall", "firewall", "add", "rule", "name=Monitorix Allow C2", "dir=out", &format!("remoteip={}", backend_ip), "action=allow"])
             .output();
             
         Ok(format!("Windows Network Isolated. Allowed only outbound to {}", backend_ip))
@@ -44,16 +44,22 @@ pub fn unisolate_network() -> Result<String, String> {
 
     #[cfg(windows)]
     {
-        let _ = crate::hidden_command!("powershell")
-            .args(["-Command", "Remove-NetFirewallRule -DisplayName 'Monitorix Lockdown Block All Outbound' -ErrorAction SilentlyContinue"])
+        let _ = crate::hidden_command!("netsh")
+            .args(["advfirewall", "firewall", "delete", "rule", "name=Monitorix Lockdown Block All Outbound"])
             .output();
-        let _ = crate::hidden_command!("powershell")
-            .args(["-Command", "Remove-NetFirewallRule -DisplayName 'Monitorix Lockdown Block All Inbound' -ErrorAction SilentlyContinue"])
+        let _ = crate::hidden_command!("netsh")
+            .args(["advfirewall", "firewall", "delete", "rule", "name=Monitorix Lockdown Block All Inbound"])
             .output();
-        let _ = crate::hidden_command!("powershell")
-            .args(["-Command", "Remove-NetFirewallRule -DisplayName 'Monitorix Allow C2' -ErrorAction SilentlyContinue"])
+        let _ = crate::hidden_command!("netsh")
+            .args(["advfirewall", "firewall", "delete", "rule", "name=Monitorix Allow C2"])
             .output();
             
         Ok("Windows Network Unisolated. Removed isolation rules.".to_string())
     }
 }
+
+pub fn isolate_host() -> Result<String, String> {
+    crate::log_msg("[Lockdown] Instant host isolation triggered by canary tamper guard!");
+    isolate_network("127.0.0.1")
+}
+

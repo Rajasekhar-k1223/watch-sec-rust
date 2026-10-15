@@ -39,6 +39,8 @@ pub fn check_av_status() -> serde_json::Value {
             pub display_name: String,
         }
 
+        let mut wmi_success = false;
+
         if let Ok(com_con) = COMLibrary::new() {
             if let Ok(wmi_con) = WMIConnection::with_namespace_path("ROOT\\SecurityCenter2", com_con.into()) {
                 if let Ok(results) = wmi_con.raw_query::<AntivirusProduct>("SELECT * FROM AntivirusProduct") {
@@ -48,9 +50,29 @@ pub fn check_av_status() -> serde_json::Value {
                     } else {
                         details = "No AV registered in SecurityCenter2".to_string();
                     }
-                } else {
-                    details = "Failed to query SecurityCenter2 WMI".to_string();
+                    wmi_success = true;
                 }
+            }
+        }
+
+        if !wmi_success {
+            let mut sys = sysinfo::System::new();
+            sys.refresh_processes();
+            let av_processes = ["msmpeng.exe", "rtvscan.exe", "avp.exe", "mbam.exe", "csagent.exe", "sentinelagent.exe"];
+            
+            for process in sys.processes().values() {
+                let name = process.name().to_string().to_lowercase();
+                for av in av_processes.iter() {
+                    if name.contains(av) {
+                        av_found = true;
+                        details = format!("Found AV Process (WMI Fallback): {}", name);
+                        break;
+                    }
+                }
+                if av_found { break; }
+            }
+            if !av_found {
+                details = "WMI Disabled: No known AV process found via sysinfo fallback".to_string();
             }
         }
     }

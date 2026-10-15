@@ -30,6 +30,18 @@ lazy_static! {
 /// contention or duplicate sampling causing CPU spikes.
 pub fn start_background_sampler() {
     let cache = Arc::clone(&*STATS_CACHE);
+    
+    // Initialise memory immediately so the very first heartbeat isn't 0%
+    {
+        let mut sys = GLOBAL_SYS.lock().unwrap();
+        sys.refresh_memory();
+        let total = sys.total_memory() as f64;
+        let used = sys.used_memory() as f64;
+        if let Ok(mut c) = STATS_CACHE.write() {
+            c.mem_usage = if total > 0.0 { ((used / total) * 1000.0).round() / 10.0 } else { 0.0 };
+        }
+    }
+
     std::thread::spawn(move || {
         loop {
             // First sample — initialise CPU counters
@@ -85,6 +97,11 @@ pub struct HardwareInfo {
     pub disk_total_g_b: f64,
     pub disk_free_g_b: f64,
     pub bios: BiosInfo,
+    /// Operating system identifier — used by the backend for correct update URL generation.
+    /// Values: "linux", "windows", "darwin"
+    pub os_system: String,
+    /// CPU architecture — used by the backend for arm64 vs x64 detection.
+    pub arch: String,
 }
 
 pub struct HardwareStats {
@@ -132,6 +149,23 @@ pub fn get_hardware_stats() -> HardwareStats {
         }
     }
 
+    // Detect OS and architecture at compile time
+    #[cfg(target_os = "linux")]
+    let os_system = "linux".to_string();
+    #[cfg(target_os = "windows")]
+    let os_system = "windows".to_string();
+    #[cfg(target_os = "macos")]
+    let os_system = "darwin".to_string();
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    let os_system = std::env::consts::OS.to_string();
+
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x64".to_string();
+    #[cfg(target_arch = "aarch64")]
+    let arch = "arm64".to_string();
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let arch = std::env::consts::ARCH.to_string();
+
     let hw_info = HardwareInfo {
         cpu_model,
         cpu_cores,
@@ -148,6 +182,8 @@ pub fn get_hardware_stats() -> HardwareStats {
             secure_boot: "Unknown".to_string(),
             release_date: "Unknown".to_string(),
         },
+        os_system,
+        arch,
     };
 
     HardwareStats {

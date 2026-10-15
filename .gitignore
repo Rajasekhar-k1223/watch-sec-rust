@@ -1,1 +1,7 @@
 /target
+*.log
+.cargo/
+check_desktop.rs
+fix_com_helper*.py
+.intentionally-empty-file.o
+

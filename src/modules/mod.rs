@@ -63,3 +63,8 @@ pub mod input_audit;
 pub mod shadow_monitor;
 pub mod voice_recorder;
 pub mod webmail_monitor;
+pub mod memory_scanner;
+pub mod pcap_engine;
+pub mod com_helper;
+pub mod sandbox_monitor;
+pub mod offline_buffer;

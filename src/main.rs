@@ -70,7 +70,7 @@ macro_rules! agent_log {
     ($($arg:tt)*) => { $crate::log_msg(&format!($($arg)*)) };
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() {
     // CRITICAL: Install rustls crypto provider FIRST before any TLS operations.
     // Required by rustls 0.23+ (pulled in by tokio-tungstenite 0.30).
@@ -99,7 +99,7 @@ async fn main() {
         {
             let exe_path = current_exe.to_string_lossy().to_string();
             log_msg("[Persistence] Ensuring Windows Scheduled Task exists...");
-            let out = std::process::Command::new("schtasks")
+            let out = crate::hidden_command!("schtasks")
                 .args(&[
                     "/Create",
                     "/F",
@@ -112,7 +112,7 @@ async fn main() {
             if let Ok(res) = out {
                 if !res.status.success() {
                     // Fallback to ONLOGON if not running as admin
-                    let _ = std::process::Command::new("schtasks")
+                    let _ = crate::hidden_command!("schtasks")
                         .args(&[
                             "/Create",
                             "/F",
@@ -127,7 +127,7 @@ async fn main() {
 
         loop {
             log_msg("[Watchdog] Spawning worker process...");
-            let mut cmd = std::process::Command::new(&current_exe);
+            let mut cmd = crate::hidden_command!(&current_exe);
             cmd.arg("--worker");
             
             // Forward existing arguments
@@ -182,6 +182,43 @@ async fn main() {
             );
         }
         log_msg(&format!("[Boot] Detected Windows Session ID: {}", session_id));
+        
+        if session_id == 0 {
+            let args: Vec<String> = std::env::args().collect();
+            if !args.iter().any(|a| a == "--escaped") {
+                log_msg("[Boot] Trapped in Session 0! Attempting to escape via PowerShell and schtasks...");
+                let script = r#"
+                    $user = (Get-WmiObject -Class Win32_ComputerSystem).UserName
+                    if ($user) {
+                        Write-Host $user
+                    }
+                "#;
+                let output = crate::hidden_command!("powershell")
+                    .args(&["-NoProfile", "-Command", script])
+                    .output();
+                    
+                if let Ok(out) = output {
+                    let active_user = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !active_user.is_empty() {
+                        log_msg(&format!("[Boot] Found active user: {}", active_user));
+                        let exe_path = std::env::current_exe().unwrap().to_string_lossy().to_string();
+                        
+                        let _ = crate::hidden_command!("schtasks")
+                            .args(&["/Create", "/F", "/TN", "MonitorixEscape", "/TR", &format!("\"{}\" --escaped", exe_path), "/SC", "ONCE", "/ST", "00:00", "/RU", &active_user])
+                            .output();
+                            
+                        let _ = crate::hidden_command!("schtasks")
+                            .args(&["/Run", "/TN", "MonitorixEscape"])
+                            .output();
+                            
+                        log_msg("[Boot] Triggered escape task. SYSTEM agent continuing in Session 0.");
+                        // Do NOT exit here! The SYSTEM agent must stay alive to handle updates and network monitoring.
+                    } else {
+                        log_msg("[Boot] Failed to find active user. Cannot escape.");
+                    }
+                }
+            }
+        }
     }
 
     // Single instance lock (per session)
@@ -211,6 +248,7 @@ async fn main() {
         .timeout(Duration::from_secs(10))
         .use_rustls_tls()
         .tls_built_in_root_certs(true)
+        .trust_dns(true)
         .build()
     {
         Ok(c) => { log_msg("[Boot] HTTP client ready."); c }
@@ -303,14 +341,9 @@ async fn main() {
     let activity_client = client.clone();
     let activity_config = config.clone();
     tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_secs(30)); // Activity audit every 30s
+        let mut interval = time::interval(Duration::from_secs(2)); // Live Activity audit every 2s
         
-        // Track idle time: if we haven't seen an active window in IDLE_REPORT_INTERVAL,
-        // send a SystemIdle event so the backend always has continuity.
-        // This handles systems that sit untouched for hours, days, or weeks.
-        const IDLE_REPORT_INTERVAL_SECS: u64 = 300; // Report idle every 5 minutes
-        let mut last_active_report = std::time::Instant::now();
-        let mut last_idle_report = std::time::Instant::now();
+        // Session activity is chunked inside the session_activity module natively.
 
         loop {
             interval.tick().await;
@@ -331,7 +364,8 @@ async fn main() {
             }
 
             if is_service {
-                // Background service in Session 0 cannot see UI. Skip activity tracking to avoid false 'Idle' logs.
+                // Background service in Session 0 cannot see UI. Skip activity tracking to avoid
+                // false 'Idle' logs.
                 continue;
             }
 
@@ -361,49 +395,6 @@ async fn main() {
                         .send()
                         .await;
 
-                    last_active_report = std::time::Instant::now();
-                }
-            } else {
-                // --- System is IDLE: no active window detected ---
-                // If idle for >= IDLE_REPORT_INTERVAL_SECS, send a SystemIdle event.
-                // This ensures we always have audit continuity — even after days of no interaction.
-                let secs_since_idle_report = last_idle_report.elapsed().as_secs();
-                if secs_since_idle_report >= IDLE_REPORT_INTERVAL_SECS {
-                    let idle_duration_secs = last_active_report.elapsed().as_secs();
-                    let idle_payload = serde_json::json!({
-                        "AgentId":       activity_config.agent_id,
-                        "TenantApiKey":  activity_config.machine_secret,
-                        "ActivityType":  "SystemIdle",
-                        "ProcessName":   "System",
-                        "WindowTitle":   "System Idle",
-                        "Url":           serde_json::Value::Null,
-                        "DurationSeconds": idle_duration_secs,
-                        "Timestamp":     chrono::Utc::now().to_rfc3339(),
-                    });
-
-                    let url = format!("{}/api/events/activity", activity_config.backend_url);
-                    let body = serde_json::to_string(&idle_payload).unwrap_or_default();
-                    let timestamp_str = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                        .to_string();
-                    let signature = crate::api::generate_signature(&activity_config.tenant_api_key, &body, &timestamp_str);
-
-                    let _ = activity_client.post(&url)
-                        .header("Content-Type", "application/json")
-                        .header("X-Signature", signature)
-                        .header("X-Timestamp", timestamp_str)
-                        .body(body)
-                        .send()
-                        .await;
-
-                    crate::log_msg(&format!(
-                        "[SessionActivity] System idle for {}s — sent SystemIdle event.",
-                        idle_duration_secs
-                    ));
-
-                    last_idle_report = std::time::Instant::now();
                 }
             }
         }
@@ -422,12 +413,14 @@ async fn main() {
         }
     }
 
-    if is_primary_agent {
-        log_msg("[Boot] Deploying deception decoys...");
+    if is_primary_agent && config.deception_enabled {
+        log_msg("[Boot] Deception mode enabled — deploying decoy files...");
         engines::deception::deploy_decoy();
         
         // Deploy Ransomware Decoys
         engines::ransomware_decoy::deploy_decoy();
+    } else if is_primary_agent {
+        log_msg("[Boot] Deception mode disabled — skipping decoy deployment.");
     }
     // ── Shared live config ─────────────────────────────────────────────────────
     // The heartbeat response updates runtime toggles (e.g. MailMonitorEnabled).
@@ -447,6 +440,11 @@ async fn main() {
         });
     }
 
+    if is_primary_agent {
+        let sb_tx = event_tx.clone();
+        let sb_cfg = live_config.clone();
+        modules::sandbox_monitor::start_sandbox_monitor(sb_tx, sb_cfg);
+    }
     let rest_client = client.clone();
     if is_primary_agent {
         tokio::spawn(async move {
@@ -487,12 +485,7 @@ async fn main() {
         modules::self_defense::start_watchdog(event_tx.clone());
 
         // Use OS-appropriate paths for File Integrity Monitoring
-        #[cfg(target_os = "windows")]
-        let fim_paths = vec!["C:\\Windows\\System32\\drivers\\etc", "C:\\ProgramData"];
-        #[cfg(not(target_os = "windows"))]
-        let fim_paths = vec!["/etc"];
-        
-        modules::fim::start(fim_paths, event_tx.clone());
+        // FIM initialization moved below
     }
 
 
@@ -500,16 +493,24 @@ async fn main() {
         // Start Process and System Monitors
         modules::process_monitor::start(event_tx.clone(), Arc::clone(&live_config));
         modules::system_monitor::start(event_tx.clone());
-        // Deception Engine Initialization
-        crate::modules::deception::deploy_honeyfiles(&config.agent_id);
-        let deception_agent_id = config.agent_id.clone();
-        tokio::spawn(async move {
-            crate::modules::deception::deploy_shadow_service(deception_agent_id).await;
-        });
+        modules::session_activity::start_live_telemetry(event_tx.clone());
+        // Deception Engine Initialization — only if explicitly enabled in policy
+        if config.deception_enabled {
+            crate::log_msg("[Boot] DeceptionEnabled=true — deploying honeyfiles to user folders...");
+            crate::modules::deception::deploy_honeyfiles(&config.agent_id);
+            let deception_agent_id = config.agent_id.clone();
+            tokio::spawn(async move {
+                crate::modules::deception::deploy_shadow_service(deception_agent_id).await;
+            });
+        } else {
+            crate::log_msg("[Boot] DeceptionEnabled=false — cleaning up any legacy honeyfiles...");
+            crate::modules::deception::cleanup_honeyfiles();
+        }
         // Start asynchronous watchdogs
         crate::modules::dlp_engine::start_dlp_monitor(event_tx.clone());
 
-        crate::modules::usb_monitor::start_usb_monitor(event_tx.clone());
+        crate::modules::usb_monitor::start_usb_monitor(event_tx.clone(), Arc::clone(&live_config));
+        crate::modules::fim::start_fim(event_tx.clone(), Arc::clone(&live_config));
     }
     
     // Fallback: Read initial config if present
@@ -526,7 +527,7 @@ async fn main() {
     if is_primary_agent {
         tokio::spawn(async move {
             // Screenshot interval is configurable — check live_config each iteration
-        let mut last_screenshot = std::time::Instant::now();
+        let _last_screenshot = std::time::Instant::now();
         // [FIX] Reduced security scan interval from 1 hour to 5 minutes so vulnerabilities are detected quickly!
         let mut scan_interval = time::interval(std::time::Duration::from_secs(300)); 
         let mut ticks = 0;
@@ -534,23 +535,34 @@ async fn main() {
             scan_interval.tick().await;
             ticks += 1;
             
-            let deception_findings = crate::modules::deception::audit_traps();
+            let (deception_findings, av_status, fw_status, session_status, mem_alerts, usbs, local_users, startup_programs, network_connections, cis_report, cron_audit, patch_inv) = tokio::task::spawn_blocking(|| {
+                let d = crate::modules::deception::audit_traps();
+                let av = modules::av_monitor::check_av_status();
+                let fw = modules::firewall_monitor::check_firewall_status();
+                let ss = modules::session_audit::get_active_sessions();
+                let ma = modules::memory_scanner::scan_memory();
+                let u = modules::usb_monitor::get_connected_usbs();
+                let lu = modules::local_users::get_local_users();
+                let sp = modules::startup_programs::get_startup_programs();
+                let nc = modules::network_connections::get_network_connections();
+                let cr = modules::cis_audit::perform_audit();
+                let ca = modules::cron_audit::audit_scheduled_tasks();
+                let pi = modules::patch_inventory::get_installed_packages();
+                (d, av, fw, ss, ma, u, lu, sp, nc, cr, ca, pi)
+            }).await.unwrap();
+
             for finding in deception_findings {
                 let _ = security_tx.send(finding);
             }
             
-            let av_status = modules::av_monitor::check_av_status();
             let _ = security_tx.send(av_status);
-            
-            let fw_status = modules::firewall_monitor::check_firewall_status();
             let _ = security_tx.send(fw_status);
-
-            let session_status = modules::session_audit::get_active_sessions();
             let _ = security_tx.send(session_status);
 
-
+            for alert in mem_alerts {
+                let _ = security_tx.send(alert);
+            }
             
-            let usbs = modules::usb_monitor::get_connected_usbs();
             if !usbs.is_empty() {
                 let usb_event = serde_json::json!({
                     "type": "UsbConnected",
@@ -559,28 +571,17 @@ async fn main() {
                 let _ = security_tx.send(usb_event);
             }
 
-            let local_users = modules::local_users::get_local_users();
             let _ = security_tx.send(local_users);
-
-            let startup_programs = modules::startup_programs::get_startup_programs();
             let _ = security_tx.send(startup_programs);
-
-            let network_connections = modules::network_connections::get_network_connections();
             let _ = security_tx.send(network_connections);
-
-            let cis_report = modules::cis_audit::perform_audit();
             let _ = security_tx.send(cis_report);
-
-            let cron_audit = modules::cron_audit::audit_scheduled_tasks();
             let _ = security_tx.send(cron_audit);
-
-            let patch_inv = modules::patch_inventory::get_installed_packages();
             let _ = security_tx.send(patch_inv.clone());
             
             // GAP 5 & 6: SBOM Reporting & Vulnerability Scan Trigger
             let (is_vuln_on, local_agent_id) = {
                 let lc = live_config_scan.lock().unwrap();
-                (lc.dlp_enabled, upload_agent_id.clone())
+                (lc.vulnerability_intelligence_enabled, upload_agent_id.clone())
             };
             
             if is_vuln_on {
@@ -797,8 +798,8 @@ async fn main() {
             // Correct URL: POST /api/speech/upload/{agent_id}  (agent_id in path)
             if voice_on {
                 let voice_client   = upload_client.clone();
-                // FIX GAP 11: agent_id is in the URL path, not just the body
-                let voice_url      = format!("{}/api/speech/upload/{}", backend_url, agent_id);
+                // FIX GAP 11: agent_id is in the URL path, not just the body (Actually, backend expects just /api/speech/upload)
+                let voice_url      = format!("{}/api/speech/upload", backend_url);
                 let voice_agent_id = agent_id.clone();
                 let voice_secret   = machine_secret.clone();
                 let voice_key      = tenant_key.clone();
@@ -1009,11 +1010,18 @@ async fn main() {
                 let clipboard = crate::modules::clipboard_audit::audit_clipboard();
                 if let Some(contents) = clipboard.get("ClipboardContents").and_then(|v| v.as_str()) {
                     if !contents.is_empty() && contents != "[Clipboard is empty]" {
+                        let lower_contents = contents.to_lowercase();
+                        let keywords = ["password", "confidential", "secret", "credit card", "api_key"];
+                        let is_alert = keywords.iter().any(|k| lower_contents.contains(k));
+                        let severity = if is_alert { "High" } else { "Low" };
+
                         let payload = serde_json::json!({
                             "Type":      "ClipboardCapture",
                             "AgentId":  agent_id,
                             "Details":   contents,
                             "Timestamp": chrono::Utc::now().to_rfc3339(),
+                            "IsAlert":   is_alert,
+                            "Severity":  severity,
                         });
                         let url = format!("{}/api/events/report", backend_url);
                         let body_str = serde_json::to_string(&payload).unwrap_or_default();
@@ -1063,17 +1071,15 @@ async fn main() {
     });
 
     loop {
+        crate::log_msg("[Main] Waiting for interval.tick()...");
         interval.tick().await;
+        crate::log_msg("[Main] Calling send_heartbeat...");
         match api::send_heartbeat(&client, &config).await {
-
             Ok(updated) => {
-                // Propagate ALL runtime toggle changes back into the shared live config.
-                // This notifies the background scan loop of any toggle changes
-                // without requiring a restart.
+                crate::log_msg("[Main] send_heartbeat returned Ok");
                 if let Ok(mut lc) = live_config.lock() {
                     *lc = updated.clone();
                 }
-                // Also start shadow watcher if newly enabled
                 if updated.shadow_audit_enabled && !config.shadow_audit_enabled {
                     let paths = updated.shadow_paths.clone();
                     crate::log_msg(&format!("[ShadowMonitor] Starting watcher on {} paths.", paths.len()));
@@ -1082,6 +1088,7 @@ async fn main() {
                 config = updated;
             }
             Err(e) => {
+                crate::log_msg(&format!("[Main] [Error] Failed to send heartbeat: {}", e));
                 eprintln!("[Error] Failed to send heartbeat: {}", e);
             }
         }

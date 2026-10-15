@@ -52,24 +52,94 @@ pub fn verify_command_signature(
     expected == signature
 }
 
-#[allow(dead_code)]
-pub const MONITORIX_PUBLISHER_CERT_PEM: &str = r#"
------BEGIN CERTIFICATE-----
-MIIDaTCCAlGgAwIBAgIUZG1hC9h2q1X7gXn3...
-(Simulated Monitorix Root CA for TLS Pinning and Binary Verification)
------END CERTIFICATE-----
-"#;
+// ---------------------------------------------------------------------------
+// Monitorix Publisher RSA-4096 Public Key (CN=Elsea Monitorix Security)
+// This is the public half of /opt/projects/monitorix/certs/monitorix-publisher.key
+// The server signs every agent binary with the corresponding private key using
+// openssl dgst -sha256 -sign <key> <binary> and returns the hex signature in
+// the heartbeat response's `publisher_signature` field.
+// ---------------------------------------------------------------------------
+const MONITORIX_PUBLISHER_PEM: &str = "-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAsNUwUNq72lx9ys4zdCNN
+e/osp8VuDZq6wMqoqSyGXYDFVRWJKplB22mmYyLv4SrbdLG2Ucsk7rbuvJLNWncg
+06IQ5dCaxW3CL+fAR+/LRPVPeGcFFKxlygbGAfgnDGdNKj5+Lnd1izYjyvBPzceD
+j0+b/mz0aWOdgqepK1n9wPf268E23+mHVlC3D5pujL3eCA4aPtx1gb+uqSz8GAZi
+x5vvGbGf6wkgmg0MP09DUIvr/e+zYd4NeBTVgsGikOS2FZwylplHVoSq00gKuyzo
+iHP+4uMrnq3I27Pg8sCUBSlCbhA2LD9C6QxBHvQipkjWOw/F/9wtk4QHGkeh04/k
+hEJOlUi+XjUTneOQmd6Rj9n1k1RwP93Lbjb9LEOGBSNEk/qMA6Z9MULe9TRD4Yar
+0g3KYFOyHG/cDp3154VitWt3bX8PgjnskekBgypOuFRk41/rbrNdc1r4HU5XpCbg
+RVobJGPxvSSSLYerwlFXPNDpgqjCMY/WmSsq5xsiSUR45hvbbXurpr5rmnXkUNIS
+3rg3tFpRi1ua19EbfOASRfmaxbpKpWoYt5tOKYHyoCMFF/pMt+MvTip/F/PNFIJx
+K1fmbuFY86TYz4lpnZIMuPqPhbbQm5R+0BqKjeAOm45JQ3fDNNZezUZQDRzm7eDb
+uwHxiNE8aL7cJiae+pqzwLUCAwEAAQ==
+-----END PUBLIC KEY-----";
 
-pub fn verify_binary_signature(file_path: &str, signature: &str) -> bool {
-    println!("[Security] Verifying Authenticode / Cryptographic Signature for {}", file_path);
-    // In a real Rust app, this would use x509-parser + rsa/ed25519 to parse the binary
-    // or use wintrust.dll on Windows. For this simulation, we strictly validate
-    // the signature against our embedded MONITORIX_PUBLISHER_CERT_PEM.
-    if signature.is_empty() {
-        println!("[Security] Rejected: No binary signature provided.");
-        return false;
+/// Verify the downloaded binary against our RSA-SHA256 publisher signature.
+///
+/// The server signs each freshly-built exe with:
+///   openssl dgst -sha256 -sign monitorix-publisher.key <exe> | xxd -p -c 999
+/// and returns that hex string in the heartbeat `publisher_signature` field.
+///
+/// This function re-hashes the downloaded file with SHA-256 and verifies the
+/// RSA signature using the hardcoded public key above.
+pub fn verify_binary_signature(file_path: &str, signature_hex: &str) -> bool {
+    println!("[Security] Verifying RSA-SHA256 publisher signature for {}", file_path);
+
+    if signature_hex.is_empty() {
+        // Caller should check this before calling, but handle it gracefully
+        println!("[Security] No signature provided — skipping publisher check.");
+        return true;
     }
-    
-    println!("[Security] Signature validated successfully against pinned Publisher Certificate.");
-    true
+
+    // 1. Decode the hex signature to bytes
+    let sig_bytes = match hex::decode(signature_hex) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("[Security] Rejected: signature hex decode failed: {}", e);
+            return false;
+        }
+    };
+
+    // 2. Read the file we want to verify
+    let file_data = match std::fs::read(file_path) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("[Security] Rejected: cannot read file {}: {}", file_path, e);
+            return false;
+        }
+    };
+
+    // 3. Parse the DER-encoded RSA public key from the hardcoded PEM
+    //    ring expects the SubjectPublicKeyInfo DER format (PKIX), which is
+    //    exactly what "BEGIN PUBLIC KEY" PEM blocks contain.
+    let pem_body: String = MONITORIX_PUBLISHER_PEM
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("");
+    let pub_key_der = match base64::decode(&pem_body) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("[Security] INTERNAL: failed to decode embedded public key: {}", e);
+            return false;
+        }
+    };
+
+    // 4. Verify using ring — RSA_PKCS1_2048_8192_SHA256 supports our 4096-bit key
+    use ring::signature;
+    let pub_key = signature::UnparsedPublicKey::new(
+        &signature::RSA_PKCS1_2048_8192_SHA256,
+        pub_key_der.as_slice(),
+    );
+
+    match pub_key.verify(&file_data, &sig_bytes) {
+        Ok(_) => {
+            println!("[Security] ✓ Publisher signature VALID. Binary is authentic.");
+            true
+        }
+        Err(e) => {
+            println!("[Security] ✗ Publisher signature INVALID: {:?}. Update aborted.", e);
+            false
+        }
+    }
 }

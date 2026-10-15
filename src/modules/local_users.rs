@@ -31,24 +31,42 @@ pub fn get_local_users() -> serde_json::Value {
 
     #[cfg(windows)]
     {
-        let cmd = crate::hidden_command!("powershell")
-            .arg("-NoProfile")
-            .arg("-Command")
-            .arg("Get-LocalUser | Select-Object Name, Enabled, Description | ConvertTo-Json -Compress")
-            .output();
+        use wmi::{COMLibrary, WMIConnection};
+        use serde::Deserialize;
 
-        if let Ok(out) = cmd {
-            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !stdout.is_empty() {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                    if let Some(arr) = parsed.as_array() {
-                        for item in arr {
-                            users.push(item.clone());
-                        }
-                    } else {
-                        users.push(parsed);
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "PascalCase")]
+        struct Win32UserAccount {
+            pub name: String,
+            pub description: Option<String>,
+            pub disabled: Option<bool>,
+        }
+
+        let mut wmi_success = false;
+
+        if let Ok(com_con) = COMLibrary::new() {
+            if let Ok(wmi_con) = WMIConnection::new(com_con) {
+                if let Ok(results) = wmi_con.raw_query::<Win32UserAccount>("SELECT Name, Description, Disabled FROM Win32_UserAccount WHERE LocalAccount=True") {
+                    for user in results {
+                        users.push(json!({
+                            "Name": user.name,
+                            "Enabled": !user.disabled.unwrap_or(false),
+                            "Description": user.description.unwrap_or_default(),
+                        }));
                     }
+                    wmi_success = true;
                 }
+            }
+        }
+
+        if !wmi_success {
+            let sys_users = sysinfo::Users::new_with_refreshed_list();
+            for user in sys_users.list() {
+                users.push(json!({
+                    "Name": user.name(),
+                    "Enabled": true, // sysinfo doesn't easily expose disabled state
+                    "Description": "Local user (fallback enumeration)",
+                }));
             }
         }
     }

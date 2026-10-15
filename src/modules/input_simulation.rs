@@ -52,67 +52,47 @@ pub fn lock_workstation() {
     let _ = crate::hidden_command!("rundll32.exe").arg("user32.dll,LockWorkStation").spawn();
 
     #[cfg(target_os = "linux")]
-    let _ = Command::new("xdg-screensaver").arg("lock").spawn();
+    let _ = crate::hidden_command!("xdg-screensaver").arg("lock").spawn();
 
     #[cfg(target_os = "macos")]
-    let _ = Command::new("/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession").arg("-suspend").spawn();
+    let _ = crate::hidden_command!("/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession").arg("-suspend").spawn();
 }
 
 pub fn toggle_curtain_mode(enable: bool) {
     #[cfg(target_os = "windows")]
     {
+        use windows::Win32::UI::WindowsAndMessaging::{SendMessageA, HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER};
+        use windows::Win32::UI::Input::KeyboardAndMouse::BlockInput;
+        use windows::Win32::Foundation::{HWND, WPARAM, LPARAM};
+
         if enable {
-            let script = r#"
-            $HWND_BROADCAST = [IntPtr]0xFFFF
-            $WM_SYSCOMMAND = 0x0112
-            $SC_MONITORPOWER = 0xF170
-            $POWER_OFF = 2
-            Add-Type -TypeDefinition '
-            using System;
-            using System.Runtime.InteropServices;
-            public class Win32 {
-                [DllImport("user32.dll")]
-                public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-                [DllImport("user32.dll")]
-                public static extern bool BlockInput(bool fBlockIt);
+            unsafe {
+                let _ = BlockInput(true);
+                SendMessageA(HWND_BROADCAST, WM_SYSCOMMAND, WPARAM(SC_MONITORPOWER as usize), LPARAM(2));
             }
-            '
-            [Win32]::BlockInput($true)
-            [Win32]::SendMessage($HWND_BROADCAST, $WM_SYSCOMMAND, [IntPtr]$SC_MONITORPOWER, [IntPtr]$POWER_OFF)
-            "#;
-            let _ = crate::hidden_command!("powershell").args(&["-Command", script]).spawn();
         } else {
-            let script = r#"
-            Add-Type -TypeDefinition '
-            using System;
-            using System.Runtime.InteropServices;
-            public class Win32 {
-                [DllImport("user32.dll")]
-                public static extern bool BlockInput(bool fBlockIt);
+            unsafe {
+                let _ = BlockInput(false);
             }
-            '
-            [Win32]::BlockInput($false)
-            "#;
-            let _ = crate::hidden_command!("powershell").args(&["-Command", script]).spawn();
         }
     }
 
     #[cfg(target_os = "linux")]
     {
         if enable {
-            let _ = Command::new("xset").args(&["dpms", "force", "off"]).spawn();
+            let _ = crate::hidden_command!("xset").args(&["dpms", "force", "off"]).spawn();
         } else {
-            let _ = Command::new("xset").args(&["dpms", "force", "on"]).spawn();
-            let _ = Command::new("xset").args(&["s", "reset"]).spawn();
+            let _ = crate::hidden_command!("xset").args(&["dpms", "force", "on"]).spawn();
+            let _ = crate::hidden_command!("xset").args(&["s", "reset"]).spawn();
         }
     }
 
     #[cfg(target_os = "macos")]
     {
         if enable {
-            let _ = Command::new("pmset").arg("displaysleepnow").spawn();
+            let _ = crate::hidden_command!("pmset").arg("displaysleepnow").spawn();
         } else {
-            let _ = Command::new("caffeinate").args(&["-u", "-t", "1"]).spawn();
+            let _ = crate::hidden_command!("caffeinate").args(&["-u", "-t", "1"]).spawn();
         }
     }
 }

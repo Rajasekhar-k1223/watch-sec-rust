@@ -30,8 +30,8 @@ pub fn start_live_desktop(agent_id: String) -> Result<String, String> {
                     let event = json!([
                         "stream_frame",
                         {
-                            "agent_id": agent_id.clone(),
-                            "frame": format!("data:image/jpeg;base64,{}", b64)
+                            "agentId": agent_id.clone(),
+                            "image": format!("data:image/jpeg;base64,{}", b64)
                         }
                     ]);
                     let msg = format!("42{}", event.to_string());

@@ -130,27 +130,24 @@ fn do_record() -> bool {
         if ok { return true; }
     }
 
-    // Fallback: PowerShell MediaPlayer / SoundCapture via .NET
-    let ps_script = format!(r#"
-Add-Type -AssemblyName System.Speech
-$recognizer = New-Object System.Speech.Recognition.SpeechRecognitionEngine
-Add-Type -Path 'C:\Windows\assembly\GAC_MSIL\NAudio\*\NAudio.dll' -ErrorAction SilentlyContinue
-
-# Minimal WAV capture via Windows Media Foundation
-$capture = New-Object -ComObject "WMEncProfile2"
-$capture | Out-Null
-
-# Use Sound Recorder command line (Windows Vista+)
-$proc = Start-Process -FilePath "SoundRecorder.exe" -ArgumentList "/FILE {save} /DURATION 00:00:{dur:02}" -PassThru -WindowStyle Hidden
-Start-Sleep -Seconds {dur}
-$proc.CloseMainWindow() | Out-Null
-"#, save = save, dur = CHUNK_SECS);
-
-    crate::hidden_command!("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps_script])
-        .output()
-        .map(|_| std::path::Path::new(save).exists())
-        .unwrap_or(false)
+    // Fallback: Use built-in Windows SoundRecorder natively
+    if let Ok(mut child) = crate::hidden_command!("SoundRecorder.exe")
+        .args(&[
+            "/FILE",
+            save,
+            "/DURATION",
+            &format!("00:00:{:02}", CHUNK_SECS),
+        ])
+        .spawn()
+    {
+        std::thread::sleep(std::time::Duration::from_secs(CHUNK_SECS as u64 + 1));
+        let _ = child.kill();
+        if std::path::Path::new(save).exists() {
+            return true;
+        }
+    }
+    
+    false
 }
 
 #[cfg(target_os = "windows")]

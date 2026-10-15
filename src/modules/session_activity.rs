@@ -59,7 +59,7 @@ pub async fn get_active_window() -> Option<serde_json::Value> {
 
         unsafe {
             let hwnd: HWND = GetForegroundWindow();
-            if hwnd.0 != std::ptr::null_mut() {
+            if hwnd.0 != 0 {
                 let mut title_buf = [0u16; 512];
                 let len = GetWindowTextW(hwnd, &mut title_buf);
                 if len > 0 {
@@ -102,19 +102,36 @@ pub async fn get_active_window() -> Option<serde_json::Value> {
     
     // Check if the window changed
     if let Some((last_title, last_process, last_time)) = last_window_guard.as_ref() {
+        let duration_secs = now.duration_since(*last_time).as_secs();
+        
         if last_title == &window_title && last_process == &process_name {
-            // Window hasn't changed, do not emit a new event yet
+            // Window hasn't changed.
+            // If it's been running for >= 5 minutes (300 seconds), emit a chunked event.
+            if duration_secs >= 300 {
+                let activity_type = if last_title == "System Idle" { "SystemIdle" } else { "AppFocus" };
+                let payload = Some(json!({
+                    "ActivityType": activity_type,
+                    "ProcessName": last_process,
+                    "WindowTitle": last_title,
+                    "Url": if url.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(url.clone()) },
+                    "DurationSeconds": duration_secs as f64,
+                }));
+                // Reset the timer for this continuing window
+                *last_window_guard = Some((window_title, process_name, now));
+                return payload;
+            }
             return None;
         }
         
         // Window changed, calculate duration for the previous window
-        let duration = now.duration_since(*last_time).as_secs_f64();
+        let activity_type = if last_title == "System Idle" { "SystemIdle" } else { "AppFocus" };
+        let duration_f64 = now.duration_since(*last_time).as_secs_f64();
         let payload = Some(json!({
-            "ActivityType": "AppFocus",
+            "ActivityType": activity_type,
             "ProcessName": last_process,
             "WindowTitle": last_title,
             "Url": if url.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(url.clone()) },
-            "DurationSeconds": duration,
+            "DurationSeconds": duration_f64,
         }));
         
         // Update the tracked window to the new one
@@ -125,4 +142,79 @@ pub async fn get_active_window() -> Option<serde_json::Value> {
         *last_window_guard = Some((window_title, process_name, now));
         return None;
     }
+}
+
+pub fn start_live_telemetry(event_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            
+            let mut window_title = String::new();
+            let mut process_name = String::new();
+            
+            #[cfg(unix)]
+            {
+                if let Ok(Ok(output)) = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    tokio::process::Command::new("xdotool").arg("getactivewindow").arg("getwindowname").output()
+                ).await {
+                    window_title = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    process_name = "Unknown(Linux)".to_string();
+                }
+            }
+            
+            #[cfg(windows)]
+            {
+                use windows::Win32::Foundation::{HWND, MAX_PATH};
+                use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId};
+                use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION};
+                use std::os::windows::ffi::OsStringExt;
+                use std::ffi::OsString;
+                
+                unsafe {
+                    let hwnd: HWND = GetForegroundWindow();
+                    if hwnd.0 != 0 {
+                        let mut title_buf = [0u16; 512];
+                        let len = GetWindowTextW(hwnd, &mut title_buf);
+                        if len > 0 {
+                            window_title = String::from_utf16_lossy(&title_buf[..len as usize]);
+                        }
+
+                        let mut pid: u32 = 0;
+                        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                        
+                        if pid > 0 {
+                            if let Ok(process_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                                let mut exe_path_buf = [0u16; MAX_PATH as usize];
+                                let mut path_len = MAX_PATH;
+                                if QueryFullProcessImageNameW(process_handle, windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0), windows::core::PWSTR(exe_path_buf.as_mut_ptr()), &mut path_len).is_ok() {
+                                    let full_path = OsString::from_wide(&exe_path_buf[..path_len as usize]).to_string_lossy().into_owned();
+                                    if let Some(name) = std::path::Path::new(&full_path).file_name() {
+                                        process_name = name.to_string_lossy().into_owned();
+                                    } else {
+                                        process_name = full_path;
+                                    }
+                                }
+                                let _ = windows::Win32::Foundation::CloseHandle(process_handle);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if window_title.is_empty() {
+                window_title = "System Idle".to_string();
+                process_name = "System".to_string();
+            }
+
+            let payload = json!({
+                "EventType": "LiveSessionTelemetry",
+                "ProcessName": process_name,
+                "WindowTitle": window_title
+            });
+
+            let _ = event_tx.send(payload);
+        }
+    });
 }

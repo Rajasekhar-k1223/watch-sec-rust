@@ -12,6 +12,7 @@ pub fn execute_script(language: &str, content: &str) -> Result<String, String> {
         "python" => "py",
         "bash" | "sh" => "sh",
         "powershell" | "ps1" => "ps1",
+        "cmd" | "bat" => "bat",
         _ => "txt",
     };
 
@@ -43,8 +44,20 @@ pub fn execute_script(language: &str, content: &str) -> Result<String, String> {
             c
         },
         "powershell" | "ps1" => {
+            // Check if powershell is allowed via local configuration
+            let allowed = std::env::var("MONITORIX_ALLOW_POWERSHELL").unwrap_or_else(|_| "0".to_string());
+            if allowed != "1" {
+                let _ = fs::remove_file(&file_path);
+                return Err("PowerShell execution is disabled by Agent configuration to comply with SOC2 strict environments.".to_string());
+            }
+
             let mut c = crate::hidden_command!("powershell");
             c.arg("-ExecutionPolicy").arg("Bypass").arg("-File").arg(&file_path);
+            c
+        },
+        "cmd" | "bat" => {
+            let mut c = crate::hidden_command!("cmd");
+            c.arg("/C").arg(&file_path);
             c
         },
         _ => {

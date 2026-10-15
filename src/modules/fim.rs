@@ -1,145 +1,154 @@
-use notify::{Watcher, RecursiveMode, EventKind};
-use notify::event::ModifyKind;
-use std::path::Path;
-use ring::digest::{Context, SHA256};
-use std::fs::File;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::Read;
 use serde_json::json;
+use ring::digest::{Context, SHA256};
+use tokio::sync::mpsc::UnboundedSender;
+use std::sync::{Arc, Mutex};
+use std::path::Path;
+use notify::{Watcher, RecursiveMode, RecommendedWatcher, Config, EventKind};
 
-pub fn start(directories: Vec<&str>, event_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>) {
-    let dirs: Vec<String> = directories.into_iter().map(|s| s.to_string()).collect();
-    
-    std::thread::spawn(move || {
-        let (tx, rx) = std::sync::mpsc::channel();
-        
-        let mut watcher = match notify::recommended_watcher(tx) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("[FIM] Failed to create watcher: {}", e);
-                return;
-            }
-        };
-
-        for dir in &dirs {
-            let path = Path::new(dir);
-            if path.exists() {
-                if let Err(e) = watcher.watch(path, RecursiveMode::Recursive) {
-                    eprintln!("[FIM] Failed to watch {}: {}", dir, e);
-                }
-            } else {
-                eprintln!("[FIM] Directory does not exist, skipping: {}", dir);
-            }
-        }
-        
-        println!("[FIM] Started watching directories");
-
-        for res in rx {
-            match res {
-                Ok(event) => {
-                    match event.kind {
-                        EventKind::Create(_) | EventKind::Modify(ModifyKind::Data(_)) => {
-                            for path in event.paths {
-                                if path.is_file() {
-                                    handle_modification(&path, &event.kind, &event_tx);
-                                }
-                            }
-                        },
-                        _ => {}
-                    }
-                },
-                Err(e) => eprintln!("[FIM] watch error: {:?}", e),
-            }
-        }
-    });
-}
-
-fn handle_modification(path: &Path, kind: &EventKind, event_tx: &tokio::sync::mpsc::UnboundedSender<serde_json::Value>) {
-    let operation = match kind {
-        EventKind::Create(_) => "CREATE",
-        EventKind::Modify(_) => "MODIFY",
-        EventKind::Access(_) => "ACCESS",
-        _ => "UNKNOWN",
-    };
-
-    // Evaluate Deception Engine (Honeypot)
-    crate::engines::deception::evaluate_access(path.to_str().unwrap_or(""), event_tx);
-
-    let hash = match calculate_hash(path) {
-        Ok(h) => h,
-        Err(_) => return, // File might be locked, deleted, or we don't have permissions
-    };
-    
-    let entropy = calculate_entropy(path).unwrap_or(0.0);
-    
-    // Check for ransomware indicators
-    let mut action_type = "FileWrite";
-    if let Some(ext) = path.extension() {
-        if ext == "lock" || ext == "enc" || ext == "crypt" {
-            action_type = "MassRename";
-        } else if entropy > 7.5 {
-            action_type = "HighEntropyWrite";
-        }
-    }
-    
-    // Evaluate via Ransomware Engine (passing PID 0 since notify doesn't provide PID)
-    crate::engines::ransomware::evaluate_file_action(0, action_type, entropy);
-
-    // Evaluate via DLP Engine if enabled
-    if crate::modules::policy::is_action_allowed("telemetry", "dlp_enabled") {
-        crate::engines::dlp_engine::scan_file(path, event_tx);
-    }
-
-    let payload = json!({
-        "EventType": "FileIntegrityAlert",
-        "FilePath": path.to_string_lossy(),
-        "Operation": operation,
-        "SHA256": hash,
-        "Entropy": entropy,
-        "Severity": "High",
-    });
-
-    println!("[FIM] Detected modification: {}", payload.to_string());
-    let _ = event_tx.send(payload);
-}
-
-fn calculate_entropy(path: &Path) -> Result<f64, std::io::Error> {
-    let mut file = File::open(path)?;
-    let mut buffer = [0; 4096];
-    let count = file.read(&mut buffer)?;
-    
-    if count == 0 {
-        return Ok(0.0);
-    }
-    
-    let mut frequencies = [0usize; 256];
-    for &byte in &buffer[..count] {
-        frequencies[byte as usize] += 1;
-    }
-    
-    let mut entropy = 0.0;
-    let len = count as f64;
-    for &freq in &frequencies {
-        if freq > 0 {
-            let p = freq as f64 / len;
-            entropy -= p * p.log2();
-        }
-    }
-    
-    Ok(entropy)
-}
-
-fn calculate_hash(path: &Path) -> Result<String, std::io::Error> {
-    let mut file = File::open(path)?;
+fn compute_sha256(path: &str) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
     let mut context = Context::new(&SHA256);
     let mut buffer = [0; 4096];
-
+    
     loop {
-        let count = file.read(&mut buffer)?;
+        let count = file.read(&mut buffer).ok()?;
         if count == 0 {
             break;
         }
         context.update(&buffer[..count]);
     }
+    
+    Some(hex::encode(context.finish().as_ref()))
+}
 
-    Ok(hex::encode(context.finish().as_ref()))
+pub fn start_fim(event_tx: UnboundedSender<serde_json::Value>, live_config: Arc<Mutex<crate::config::AgentConfig>>) {
+    std::thread::spawn(move || {
+        crate::log_msg("[FIM] Starting File Integrity Monitor with dynamic paths...");
+        
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match RecommendedWatcher::new(tx, Config::default()) {
+            Ok(w) => w,
+            Err(e) => {
+                crate::log_msg(&format!("[FIM] Failed to init watcher: {:?}", e));
+                return;
+            }
+        };
+        
+        let mut current_paths: HashSet<String> = HashSet::new();
+        let baseline: HashMap<String, String> = HashMap::new(); // path -> hash
+        
+        let event_tx_clone = event_tx.clone();
+        let baseline_clone = Arc::new(Mutex::new(baseline));
+        let baseline_listener = Arc::clone(&baseline_clone);
+        
+        // Listener thread
+        std::thread::spawn(move || {
+            for res in rx {
+                if let Ok(event) = res {
+                    match event.kind {
+                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) => {
+                            for path_buf in event.paths {
+                                if let Some(path_str) = path_buf.to_str() {
+                                    let path_str = path_str.to_string();
+                                    
+                                    // if it's a file, check hash
+                                    if path_buf.is_file() {
+                                        let new_hash_opt = compute_sha256(&path_str);
+                                        let mut b = baseline_listener.lock().unwrap();
+                                        
+                                        if let Some(new_hash) = new_hash_opt {
+                                            if let Some(old_hash) = b.get(&path_str) {
+                                                if *old_hash != new_hash {
+                                                    crate::log_msg(&format!("[FIM] ALERT: File changed - {}", path_str));
+                                                    let alert = json!({
+                                                        "EventType": "FileIntegrityAlert",
+                                                        "Severity": "Critical",
+                                                        "FilePath": path_str,
+                                                        "OldHash": old_hash,
+                                                        "NewHash": new_hash.clone(),
+                                                        "Message": format!("Monitored file modified: {}", path_str)
+                                                    });
+                                                    let _ = event_tx_clone.send(alert);
+                                                    b.insert(path_str, new_hash);
+                                                }
+                                            } else {
+                                                b.insert(path_str, new_hash);
+                                            }
+                                        } else {
+                                            // Deleted or unreadable
+                                            if b.contains_key(&path_str) {
+                                                crate::log_msg(&format!("[FIM] ALERT: File deleted - {}", path_str));
+                                                let alert = json!({
+                                                    "EventType": "FileIntegrityAlert",
+                                                    "Severity": "Critical",
+                                                    "FilePath": path_str,
+                                                    "Message": format!("Monitored file deleted: {}", path_str)
+                                                });
+                                                let _ = event_tx_clone.send(alert);
+                                                b.remove(&path_str);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        // Config polling loop
+        loop {
+            let (is_enabled, new_paths) = {
+                if let Ok(lc) = live_config.lock() {
+                    (lc.fim_enabled, lc.fim_paths.clone())
+                } else {
+                    (false, vec![])
+                }
+            };
+            
+            if is_enabled {
+                let new_paths_set: HashSet<String> = new_paths.into_iter().collect();
+                
+                // Unwatch removed paths
+                for p in current_paths.difference(&new_paths_set) {
+                    let _ = watcher.unwatch(Path::new(p));
+                    crate::log_msg(&format!("[FIM] Stopped watching: {}", p));
+                }
+                
+                // Watch new paths
+                for p in new_paths_set.difference(&current_paths) {
+                    if Path::new(p).exists() {
+                        if let Err(e) = watcher.watch(Path::new(p), RecursiveMode::Recursive) {
+                            crate::log_msg(&format!("[FIM] Error watching {}: {:?}", p, e));
+                        } else {
+                            crate::log_msg(&format!("[FIM] Started watching: {}", p));
+                            // Seed baseline
+                            if Path::new(p).is_file() {
+                                if let Some(h) = compute_sha256(p) {
+                                    if let Ok(mut b) = baseline_clone.lock() {
+                                        b.insert(p.clone(), h);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                current_paths = new_paths_set;
+            } else {
+                // Disabled, unwatch all
+                for p in &current_paths {
+                    let _ = watcher.unwatch(Path::new(p));
+                }
+                current_paths.clear();
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+    });
 }

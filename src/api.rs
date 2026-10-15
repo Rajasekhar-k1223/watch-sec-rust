@@ -49,46 +49,94 @@ fn get_primary_session() -> (String, String) {
                 }
             }
         }
+        
+        if active_user == "Unknown" {
+            if let Ok(output) = crate::hidden_command!("whoami").output() {
+                let user = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !user.is_empty() {
+                    active_user = user;
+                }
+            }
+        }
     }
 
     #[cfg(windows)]
     {
-        let script = r#"
-$user = "Unknown"
-$time = "Unknown"
-try {
-    $cs = Get-WmiObject -Class Win32_ComputerSystem
-    if ($cs.UserName) { $user = $cs.UserName }
-} catch {}
-try {
-    $explorer = Get-Process -Name explorer -ErrorAction SilentlyContinue | Sort-Object StartTime | Select-Object -First 1
-    if ($explorer) {
-        $time = $explorer.StartTime.ToString("MM/dd/yyyy HH:mm")
-        if ($user -eq "Unknown") {
-            $expUser = Get-Process -Name explorer -IncludeUserName -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($expUser -and $expUser.UserName) { $user = $expUser.UserName }
+        use wmi::{COMLibrary, WMIConnection, WMIDateTime};
+        use serde::Deserialize;
+
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "PascalCase")]
+        struct Win32ComputerSystem {
+            user_name: Option<String>,
         }
-    }
-} catch {}
-if ($user -match '.*\\(.*)') { $user = $matches[1] }
-Write-Output "$user|||$time"
-"#;
-        if let Ok(output) = crate::hidden_command!("powershell")
-            .args(&["-NoProfile", "-Command", script])
-            .output() 
-        {
-            let out_str = String::from_utf8_lossy(&output.stdout);
-            let parts: Vec<&str> = out_str.trim().split("|||").collect();
-            if parts.len() >= 2 {
-                active_user = parts[0].trim().to_string();
-                user_login_time = parts[1].trim().to_string();
-            } else if parts.len() == 1 {
-                active_user = parts[0].trim().to_string();
+
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "PascalCase")]
+        struct Win32Process {
+            name: String,
+            creation_date: Option<WMIDateTime>,
+        }
+
+        let mut wmi_success = false;
+
+        if let Ok(com_con) = COMLibrary::new() {
+            if let Ok(wmi_con) = WMIConnection::new(com_con.into()) {
+                if let Ok(results) = wmi_con.raw_query::<Win32ComputerSystem>("SELECT UserName FROM Win32_ComputerSystem") {
+                    if let Some(cs) = results.first() {
+                        if let Some(name) = &cs.user_name {
+                            active_user = name.clone();
+                            if let Some(idx) = active_user.find('\\') {
+                                active_user = active_user[idx + 1..].to_string();
+                            }
+                            wmi_success = true;
+                        }
+                    }
+                }
+                
+                if let Ok(results) = wmi_con.raw_query::<Win32Process>("SELECT Name, CreationDate FROM Win32_Process WHERE Name = 'explorer.exe'") {
+                    if let Some(proc) = results.first() {
+                        if let Some(cd) = proc.creation_date {
+                            user_login_time = cd.0.format("%m/%d/%Y %H:%M").to_string();
+                        }
+                    }
+                }
             }
+        }
+        
+        if !wmi_success {
+            let mut sys = sysinfo::System::new();
+            sys.refresh_processes();
             
-            if active_user.is_empty() {
-                active_user = "Unknown".to_string();
+            for (_pid, process) in sys.processes() {
+                if process.name().to_lowercase() == "explorer.exe" {
+                    let start_time = process.start_time();
+                    if let Some(dt) = chrono::NaiveDateTime::from_timestamp_opt(start_time as i64, 0) {
+                        user_login_time = dt.format("%m/%d/%Y %H:%M").to_string();
+                    }
+                    if let Some(user_id) = process.user_id() {
+                        active_user = user_id.to_string(); // Will be SID on Windows if sysinfo can't resolve it, but better than nothing
+                    }
+                    break;
+                }
             }
+        }
+
+        if active_user.is_empty() || active_user == "Unknown" {
+            if let Ok(output) = crate::hidden_command!("whoami").output() {
+                let user = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !user.is_empty() {
+                    let mut final_user = user;
+                    if let Some(idx) = final_user.find('\\') {
+                        final_user = final_user[idx + 1..].to_string();
+                    }
+                    active_user = final_user;
+                }
+            }
+        }
+
+        if active_user.is_empty() {
+            active_user = "Unknown".to_string();
         }
     }
 
@@ -114,15 +162,17 @@ fn generate_events_signature(secret: &str, body: &str, timestamp: &str) -> Strin
 }
 
 pub async fn send_heartbeat(client: &Client, config: &AgentConfig) -> Result<AgentConfig, Box<dyn std::error::Error>> {
+    crate::log_msg("[Heartbeat] Calling get_hardware_stats()...");
     let stats = get_hardware_stats();
     
+    crate::log_msg("[Heartbeat] Calling get_network_info()...");
     let network_info = crate::network::get_network_info(client).await;
+    
+    crate::log_msg("[Heartbeat] Calling get_installed_software()...");
     let installed_software_json = crate::software::get_installed_software();
     
-    // Get hostname
     let hostname = sysinfo::System::host_name().unwrap_or_else(|| "Unknown".to_string());
     
-    // Get MAC address for machine secret if empty
     let machine_secret = if config.machine_secret.is_empty() {
         if let Ok(Some(mac)) = get_mac_address() {
             mac.to_string()
@@ -133,9 +183,12 @@ pub async fn send_heartbeat(client: &Client, config: &AgentConfig) -> Result<Age
         config.machine_secret.clone()
     };
 
-    let (active_user, user_login_time) = get_primary_session();
-    let network_mbps = crate::network::get_network_bandwidth();
+    crate::log_msg("[Heartbeat] Calling get_power_status()...");
+    let power_status = crate::modules::power_monitor::get_power_status();
 
+    let (active_user, user_login_time) = get_primary_session();
+    crate::log_msg("[Heartbeat] Generating payload...");
+    
     let payload = HeartbeatPayload {
         agent_id: config.agent_id.clone(),
         hostname,
@@ -144,8 +197,8 @@ pub async fn send_heartbeat(client: &Client, config: &AgentConfig) -> Result<Age
         cpu_usage: stats.cpu_usage,
         memory_usage: stats.mem_usage,
         disk_usage: stats.disk_usage,
-        network_in_mbps: network_mbps.0,
-        network_out_mbps: network_mbps.1,
+        network_in_mbps: 0.0,
+        network_out_mbps: 0.0,
         local_ip: network_info.local_ip,
         public_ip: network_info.public_ip,
         latitude: network_info.latitude,
@@ -157,24 +210,21 @@ pub async fn send_heartbeat(client: &Client, config: &AgentConfig) -> Result<Age
         version: format!("v{}", env!("CARGO_PKG_VERSION")),
         hardware: stats.hw_info,
         machine_secret: machine_secret.clone(),
-        power_status: crate::modules::power_monitor::get_power_status(),
+        power_status,
     };
 
     let body = serde_json::to_string(&payload)?;
+    
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_secs()
         .to_string();
     
-    let signing_key = if !config.machine_secret.is_empty() {
-        &config.machine_secret
-    } else {
-        &config.tenant_api_key
-    };
-    
+    let signing_key = if !machine_secret.is_empty() { &machine_secret } else { &config.tenant_api_key };
     let signature = generate_signature(signing_key, &body, &timestamp);
     let url = format!("{}/api/agent/heartbeat", config.backend_url);
 
+    crate::log_msg(&format!("[Heartbeat] Sending POST to {}", url));
     let res = client.post(&url)
         .header("Content-Type", "application/json")
         .header("X-Signature", signature)
@@ -182,16 +232,17 @@ pub async fn send_heartbeat(client: &Client, config: &AgentConfig) -> Result<Age
         .body(body)
         .send()
         .await?;
+    crate::log_msg("[Heartbeat] Received HTTP response!");
 
     let mut updated_config = config.clone();
-    // CRITICAL: Save the generated machine_secret back to config so background tasks (like screenshots) use it!
     updated_config.machine_secret = machine_secret.clone();
 
     if res.status().is_success() {
         crate::log_msg("[Heartbeat] Successfully sent heartbeat.");
 
-        // Parse the response body
+        crate::log_msg("[Heartbeat] Waiting for response text...");
         if let Ok(response_body) = res.text().await {
+            crate::log_msg("[Heartbeat] Parsing response JSON...");
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response_body) {
                 // --- Parse all feature toggles and settings from heartbeat config ---
                 if let Some(cfg) = json.get("config") {
@@ -228,18 +279,26 @@ pub async fn send_heartbeat(client: &Client, config: &AgentConfig) -> Result<Age
                     updated_config.voice_enabled           = bool_field("SpeechMonitorEnabled",         Some("VoiceIntelligenceEnabled"));
                     updated_config.network_audit_enabled   = bool_field("NetworkMonitoringEnabled",     Some("NetworkAuditEnabled"));
                     updated_config.dlp_enabled             = bool_field("FileDlpEnabled",              Some("DataLossPreventionEnabled"));
+                    updated_config.vulnerability_intelligence_enabled = bool_field("VulnerabilityIntelligenceEnabled", None);
+                    updated_config.sandbox_enabled         = bool_field("SandboxEnabled",              Some("RedRainbowEnabled"));
 
                     // Settings
                     updated_config.screenshot_interval     = u64_field("ScreenshotInterval", 300).max(5);
                     updated_config.screenshot_quality      = u64_field("ScreenshotQuality",  80).min(100) as u32;
                     updated_config.shadow_paths            = str_vec_field("ShadowPaths");
                     updated_config.blocked_apps            = str_vec_field("BlockedApps");
+                    
+                    updated_config.fim_enabled             = bool_field("FileIntegrityMonitoringEnabled", None);
+                    updated_config.fim_paths               = str_vec_field("FimPaths");
+                    // DeceptionEnabled: controls whether honeyfiles are dropped on the next agent start
+                    updated_config.deception_enabled       = bool_field("DeceptionEnabled", None);
 
                     crate::log_msg(&format!(
-                        "[Config] Toggles → screenshots={} input_audit={} voice={} shadow={} mail={} dlp={}",
+                        "[Config] Toggles → screenshots={} input_audit={} voice={} shadow={} mail={} dlp={} deception={} sandbox={}",
                         updated_config.screenshots_enabled, updated_config.input_audit_enabled,
                         updated_config.voice_enabled, updated_config.shadow_audit_enabled,
                         updated_config.mail_monitor_enabled, updated_config.dlp_enabled,
+                        updated_config.deception_enabled, updated_config.sandbox_enabled
                     ));
                 }
 
@@ -255,10 +314,37 @@ pub async fn send_heartbeat(client: &Client, config: &AgentConfig) -> Result<Age
                         let url = update_url.to_string();
                         let hash = update_hash.to_string();
                         let sig  = update_signature.to_string();
+                        
+                        let agent_id_cb = config.agent_id.clone();
+                        let backend_url_cb = config.backend_url.clone();
+                        let api_key_cb = config.tenant_api_key.clone();
+                        
+                        let backend_url_err = config.backend_url.clone();
+                        let agent_id_err = config.agent_id.clone();
+                        let api_key_err = config.tenant_api_key.clone();
 
                         std::thread::spawn(move || {
-                            if let Err(e) = crate::modules::updater::trigger_update(&url, &hash, &sig) {
+                            let progress_cb = move |percent: u64| {
+                                let report_url = format!("{}/api/agents/{}/update-progress", backend_url_cb, agent_id_cb);
+                                let client = reqwest::blocking::Client::builder()
+                                    .timeout(std::time::Duration::from_secs(5))
+                                    .build().unwrap_or_default();
+                                let _ = client.post(&report_url)
+                                    .header("X-Tenant-Api-Key", &api_key_cb)
+                                    .json(&serde_json::json!({"progress": percent, "status": "downloading"}))
+                                    .send();
+                            };
+                            
+                            if let Err(e) = crate::modules::updater::trigger_update(&url, &hash, &sig, Box::new(progress_cb)) {
                                 crate::log_msg(&format!("[Updater] Update failed: {}", e));
+                                let report_url = format!("{}/api/agents/{}/update-progress", backend_url_err, agent_id_err);
+                                let client = reqwest::blocking::Client::builder()
+                                    .timeout(std::time::Duration::from_secs(5))
+                                    .build().unwrap_or_default();
+                                let _ = client.post(&report_url)
+                                    .header("X-Tenant-Api-Key", &api_key_err)
+                                    .json(&serde_json::json!({"progress": 0, "status": format!("error: {}", e)}))
+                                    .send();
                             }
                         });
                     }
@@ -293,6 +379,9 @@ pub async fn send_telemetry(client: &Client, config: &AgentConfig) -> Result<(),
         "MemoryUsage": quick.mem_usage,
         "NetworkInMbps": network_mbps.0,
         "NetworkOutMbps": network_mbps.1,
+        "TotalNetworkInGB": network_mbps.2,
+        "TotalNetworkOutGB": network_mbps.3,
+        "ActiveNicName": network_mbps.4,
         "Status": "Online",
         // Telemetry-only marker so the backend doesn't store a full report row
         "TelemetryOnly": true,
@@ -332,14 +421,18 @@ pub async fn send_telemetry(client: &Client, config: &AgentConfig) -> Result<(),
 
 #[allow(dead_code)]
 pub async fn send_events(client: &Client, config: &AgentConfig, events: &[serde_json::Value]) -> Result<(), Box<dyn std::error::Error>> {
-    if events.is_empty() {
+    // 1. Drain pending offline buffer (up to 50 events per batch)
+    let mut all_events = crate::modules::offline_buffer::drain_spool(50);
+    all_events.extend_from_slice(events);
+
+    if all_events.is_empty() {
         return Ok(());
     }
 
     let payload = json!({
         "agent_id": config.agent_id,
         "tenant_api_key": config.tenant_api_key,
-        "events": events
+        "events": all_events
     });
 
     let body = serde_json::to_string(&payload)?;
@@ -351,18 +444,26 @@ pub async fn send_events(client: &Client, config: &AgentConfig, events: &[serde_
     let signature = generate_events_signature(&config.tenant_api_key, &body, &timestamp);
     let url = format!("{}/api/agent/events", config.backend_url);
 
-    let res = client.post(&url)
+    match client.post(&url)
         .header("Content-Type", "application/json")
         .header("X-Signature", signature)
         .header("X-Timestamp", timestamp)
         .body(body)
         .send()
-        .await?;
-
-    if res.status().is_success() {
-        crate::log_msg(&format!("[EventDispatcher] Successfully sent {} events.", events.len()));
-    } else {
-        crate::log_msg(&format!("[EventDispatcher] Failed to send events: HTTP {}", res.status()));
+        .await
+    {
+        Ok(res) => {
+            if res.status().is_success() {
+                crate::log_msg(&format!("[EventDispatcher] Successfully sent {} events (including replayed offline spool).", all_events.len()));
+            } else {
+                crate::log_msg(&format!("[EventDispatcher] Server returned HTTP {}. Spooling events to offline buffer.", res.status()));
+                let _ = crate::modules::offline_buffer::spool_events(&all_events);
+            }
+        }
+        Err(e) => {
+            crate::log_msg(&format!("[EventDispatcher] Network offline or unreachable ({}). Spooling {} events to offline disk buffer.", e, all_events.len()));
+            let _ = crate::modules::offline_buffer::spool_events(&all_events);
+        }
     }
 
     Ok(())
