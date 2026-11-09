@@ -8,7 +8,7 @@ use std::time::Duration;
 
 pub fn start_sandbox_monitor(event_tx: UnboundedSender<serde_json::Value>, live_config: Arc<Mutex<crate::config::AgentConfig>>) {
     std::thread::spawn(move || {
-        crate::log_msg("[Sandbox] Starting RedRainbow Sandbox Monitor on Downloads folders...");
+        crate::log_msg("[Sandbox] Starting Monitorix Sovereign Sandbox Monitor on Downloads folders...");
 
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = match RecommendedWatcher::new(tx, Config::default()) {

@@ -93,14 +93,18 @@ fn watch_paths(paths: Vec<String>) {
             if file_name.starts_with('.') || file_name.ends_with(".tmp") { continue; }
 
             let Ok(bytes) = std::fs::read(path) else { continue; };
+            // Compute SHA-256 over raw binary bytes for cryptographic integrity
+            let raw_digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+            let sha256_hex = hex::encode(raw_digest.as_ref());
             let b64 = base64_encode(&bytes);
 
             let payload = json!({
-                "filename":   file_name,
-                "path":       path.to_string_lossy(),
-                "size":       meta.len(),
-                "file_b64":   b64,
-                "timestamp":  chrono::Utc::now().to_rfc3339(),
+                "filename":       file_name,
+                "path":           path.to_string_lossy(),
+                "size":           meta.len(),
+                "content_sha256": sha256_hex,
+                "file_b64":       b64,
+                "timestamp":      chrono::Utc::now().to_rfc3339(),
             });
 
             crate::log_msg(&format!(

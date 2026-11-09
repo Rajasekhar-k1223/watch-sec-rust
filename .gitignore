@@ -4,4 +4,10 @@
 check_desktop.rs
 fix_com_helper*.py
 .intentionally-empty-file.o
+certs/
+*.crt
+*.key
+*.pem
+*.tmp
+
 

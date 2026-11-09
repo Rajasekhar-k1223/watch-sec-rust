@@ -60,20 +60,37 @@ pub fn trigger_update(download_url: &str, expected_hash: &str, publisher_signatu
     // Otherwise, std::fs::read in verify_binary_signature will fail with a Sharing Violation (Access Denied).
     drop(dest);
 
-    crate::log_msg("[Updater] Download complete. Cryptographic hash verified.");
+    // Cryptographic SHA-256 hash verification
+    if !expected_hash.is_empty() {
+        let file_bytes = match std::fs::read(&temp_file) {
+            Ok(b) => b,
+            Err(e) => return Err(format!("Failed to read downloaded binary for hash check: {}", e)),
+        };
+        let digest = ring::digest::digest(&ring::digest::SHA256, &file_bytes);
+        let actual_hash = hex::encode(digest.as_ref());
+        if !expected_hash.eq_ignore_ascii_case(&actual_hash) {
+            let _ = std::fs::remove_file(&temp_file);
+            return Err(format!(
+                "Cryptographic hash verification failed! Expected: {}, Actual: {}",
+                expected_hash, actual_hash
+            ));
+        }
+        crate::log_msg(&format!("[Updater] Download complete. Cryptographic hash verified ({}).", actual_hash));
+    } else {
+        crate::log_msg("[Updater] Download complete. No expected hash provided.");
+    }
 
-    // Only run Ed25519 publisher signature check if the server actually provided one.
-    // When publisher_signature is empty, the SHA256 hash check above is the sole
-    // integrity gate — this matches the current server heartbeat response format.
+    // Only run publisher signature check if the server actually provided one.
     if !publisher_signature.is_empty() {
         if let Some(temp_file_str) = temp_file.to_str() {
             if !crate::c2::verify::verify_binary_signature(temp_file_str, publisher_signature) {
                 crate::log_msg("[Updater] CRITICAL: Publisher signature validation failed. Rejecting payload.");
+                let _ = std::fs::remove_file(&temp_file);
                 return Err("Publisher certificate signature invalid. Refusing to install rogue payload.".to_string());
             }
         }
     } else {
-        crate::log_msg("[Updater] No publisher signature provided by server — relying on hash verification only.");
+        crate::log_msg("[Updater] No publisher signature provided by server — relying on hash verification.");
     }
 
     crate::log_msg("[Updater] Swapping binary and restarting service...");

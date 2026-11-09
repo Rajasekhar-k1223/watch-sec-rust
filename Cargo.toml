@@ -1,6 +1,6 @@
 [package]
 name = "monitorix-agent"
-version = "2.5.0"
+version = "4.2.0"
 edition = "2021"
 
 [dependencies]
@@ -20,7 +20,7 @@ lazy_static = "1.5.0"
 regex = "1.13.1"
 libloading = "0.8"
 # gRPC Dependencies
-tonic = "0.10"
+tonic = { version = "0.10", features = ["tls", "tls-roots"] }
 prost = "0.12"
 tokio-stream = "0.1"
 chrono = "0.4"

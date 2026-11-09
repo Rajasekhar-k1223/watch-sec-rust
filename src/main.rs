@@ -752,12 +752,14 @@ async fn main() {
                 let shadow_uploads = modules::shadow_monitor::drain_upload_queue();
                 for sf in shadow_uploads {
                     let mut payload = sf.clone();
-                    // Compute SHA256 of the raw bytes from file_b64 for forensic integrity
-                    let sha256_hex = if let Some(b64) = sf.get("file_b64").and_then(|v| v.as_str()) {
-                        // Simple hex SHA256 via ring crate already in deps
+                    // Compute SHA256 of the raw bytes (decoded from file_b64 or precomputed) for forensic integrity
+                    let sha256_hex = if let Some(existing_hash) = sf.get("content_sha256").and_then(|v| v.as_str()) {
+                        existing_hash.to_string()
+                    } else if let Some(b64) = sf.get("file_b64").and_then(|v| v.as_str()) {
                         use ring::digest;
-                        let raw = b64.as_bytes();
-                        let hash = digest::digest(&digest::SHA256, raw);
+                        use base64::{engine::general_purpose, Engine as _};
+                        let raw_bytes = general_purpose::STANDARD.decode(b64.trim()).unwrap_or_default();
+                        let hash = digest::digest(&digest::SHA256, &raw_bytes);
                         hex::encode(hash.as_ref())
                     } else {
                         String::new()

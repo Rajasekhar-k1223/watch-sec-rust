@@ -26,7 +26,7 @@ pub struct AgentConfig {
     #[serde(skip)] pub network_audit_enabled:   bool,   // NetworkAuditEnabled
     #[serde(skip)] pub dlp_enabled:             bool,   // DataLossPreventionEnabled
     #[serde(skip)] pub vulnerability_intelligence_enabled: bool, // VulnerabilityIntelligenceEnabled
-    #[serde(skip)] pub sandbox_enabled:         bool,   // SandboxEnabled / RedRainbowEnabled
+    #[serde(skip)] pub sandbox_enabled:         bool,   // SandboxEnabled / DynamicSandboxEnabled
 
     // ── Runtime settings (from heartbeat response) ────────────────────────────
     #[serde(skip)] pub screenshot_interval:     u64,    // ScreenshotInterval (seconds)

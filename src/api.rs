@@ -280,7 +280,7 @@ pub async fn send_heartbeat(client: &Client, config: &AgentConfig) -> Result<Age
                     updated_config.network_audit_enabled   = bool_field("NetworkMonitoringEnabled",     Some("NetworkAuditEnabled"));
                     updated_config.dlp_enabled             = bool_field("FileDlpEnabled",              Some("DataLossPreventionEnabled"));
                     updated_config.vulnerability_intelligence_enabled = bool_field("VulnerabilityIntelligenceEnabled", None);
-                    updated_config.sandbox_enabled         = bool_field("SandboxEnabled",              Some("RedRainbowEnabled"));
+                    updated_config.sandbox_enabled         = bool_field("SandboxEnabled",              Some("DynamicSandboxEnabled"));
 
                     // Settings
                     updated_config.screenshot_interval     = u64_field("ScreenshotInterval", 300).max(5);

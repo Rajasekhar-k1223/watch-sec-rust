@@ -1,5 +1,5 @@
 //! [v3.0.0] Feature 55: Agent Reliability & Offline Buffering Engine
-//! Provides disk-backed FIFO spooling, sequence numbering, and SHA-256 event fingerprinting.
+//! Provides disk-backed FIFO ring buffer spooling, sequence numbering, and SHA-256 event fingerprinting.
 //! Guarantees zero data loss during network outages and enables clean deduplication on reconnection.
 
 use std::fs::{self, OpenOptions};
@@ -15,8 +15,7 @@ lazy_static! {
     static ref SEQUENCE_COUNTER: Mutex<u64> = Mutex::new(1);
 }
 
-#[allow(dead_code)]
-const MAX_SPOOL_CAPACITY: usize = 10_000;
+pub const MAX_SPOOL_CAPACITY: usize = 10_000;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SpooledEvent {
@@ -56,7 +55,34 @@ pub fn calculate_event_fingerprint(event: &serde_json::Value) -> String {
     hex::encode(hash.as_ref())
 }
 
-/// Spools a batch of events to the local disk buffer
+/// Enforces the FIFO ring-buffer capacity policy.
+/// When the spool exceeds `max_capacity`, the oldest lines are pruned, strictly retaining
+/// the newest events in chronological order while guaranteeing bounded disk usage.
+pub fn enforce_ring_buffer_capacity(spool_path: &PathBuf, max_capacity: usize) {
+    if !spool_path.exists() {
+        return;
+    }
+
+    if let Ok(file) = fs::File::open(spool_path) {
+        let lines: Vec<String> = BufReader::new(file)
+            .lines()
+            .filter_map(Result::ok)
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+
+        if lines.len() > max_capacity {
+            let keep_from = lines.len() - max_capacity;
+            let retained = &lines[keep_from..];
+            if let Ok(mut out_file) = fs::File::create(spool_path) {
+                for line in retained {
+                    let _ = writeln!(out_file, "{}", line);
+                }
+            }
+        }
+    }
+}
+
+/// Spools a batch of events to the local disk ring buffer
 pub fn spool_events(events: &[serde_json::Value]) -> Result<usize, String> {
     if events.is_empty() {
         return Ok(0);
@@ -96,8 +122,11 @@ pub fn spool_events(events: &[serde_json::Value]) -> Result<usize, String> {
         }
     }
 
+    // Strictly enforce ring buffer capacity cap to prevent unbounded disk growth
+    enforce_ring_buffer_capacity(&spool_path, MAX_SPOOL_CAPACITY);
+
     crate::log_msg(&format!(
-        "[OfflineBuffer] Spooled {} events to disk ({:?})",
+        "[OfflineBuffer] Spooled {} events to disk ring buffer ({:?})",
         count, spool_path
     ));
     Ok(count)
@@ -123,6 +152,9 @@ pub fn drain_spool(max_count: usize) -> Vec<serde_json::Value> {
 
     for (idx, line_res) in reader.lines().enumerate() {
         if let Ok(line) = line_res {
+            if line.trim().is_empty() {
+                continue;
+            }
             if idx < max_count {
                 if let Ok(spooled) = serde_json::from_str::<SpooledEvent>(&line) {
                     let mut obj = spooled.payload;
@@ -130,6 +162,7 @@ pub fn drain_spool(max_count: usize) -> Vec<serde_json::Value> {
                         map.insert("SequenceId".to_string(), serde_json::json!(spooled.sequence_id));
                         map.insert("EventFingerprint".to_string(), serde_json::json!(spooled.event_fingerprint));
                         map.insert("IsBufferedReplay".to_string(), serde_json::json!(true));
+                        map.insert("original_timestamp".to_string(), serde_json::json!(spooled.original_timestamp));
                     }
                     drained_events.push(obj);
                 }
@@ -170,10 +203,47 @@ pub fn get_spool_count() -> usize {
     }
 
     if let Ok(file) = fs::File::open(&spool_path) {
-        BufReader::new(file).lines().count()
+        BufReader::new(file).lines().filter_map(Result::ok).filter(|l| !l.trim().is_empty()).count()
     } else {
         0
     }
+}
+
+/// Returns offline spool health diagnostics and ring buffer utilization stats
+pub fn get_spool_stats() -> serde_json::Value {
+    let _guard = BUFFER_LOCK.lock().unwrap();
+    let spool_path = get_spool_path();
+    let count = if spool_path.exists() {
+        if let Ok(file) = fs::File::open(&spool_path) {
+            BufReader::new(file).lines().filter_map(Result::ok).filter(|l| !l.trim().is_empty()).count()
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let size_bytes = if spool_path.exists() {
+        fs::metadata(&spool_path).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let utilization = if MAX_SPOOL_CAPACITY > 0 {
+        (count as f64 / MAX_SPOOL_CAPACITY as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    serde_json::json!({
+        "status": "online",
+        "policy": "FIFO_RING_BUFFER",
+        "spool_file": spool_path.to_string_lossy(),
+        "max_capacity_events": MAX_SPOOL_CAPACITY,
+        "current_queued_events": count,
+        "spool_file_bytes": size_bytes,
+        "buffer_utilization_pct": (utilization * 100.0).round() / 100.0
+    })
 }
 
 #[cfg(test)]
@@ -212,6 +282,35 @@ mod tests {
         assert_eq!(first.get("IsBufferedReplay").and_then(|v| v.as_bool()), Some(true));
         assert!(first.get("EventFingerprint").is_some());
         assert!(first.get("SequenceId").is_some());
+        assert!(first.get("original_timestamp").is_some());
+    }
+
+    #[test]
+    fn test_ring_buffer_capacity_rotation() {
+        let temp_spool = std::env::temp_dir().join(".monitorix_test_ring_buffer.jsonl");
+        let _ = fs::remove_file(&temp_spool);
+
+        // Write 15 lines
+        {
+            let mut f = fs::File::create(&temp_spool).unwrap();
+            for i in 1..=15 {
+                let _ = writeln!(f, "{{\"seq\": {}}}", i);
+            }
+        }
+
+        // Enforce capacity of 10
+        enforce_ring_buffer_capacity(&temp_spool, 10);
+
+        let lines: Vec<String> = BufReader::new(fs::File::open(&temp_spool).unwrap())
+            .lines()
+            .filter_map(Result::ok)
+            .collect();
+
+        assert_eq!(lines.len(), 10);
+        // The first line should now be seq: 6 (oldest 5 pruned)
+        assert!(lines[0].contains("\"seq\": 6"));
+        assert!(lines[9].contains("\"seq\": 15"));
+
+        let _ = fs::remove_file(&temp_spool);
     }
 }
-

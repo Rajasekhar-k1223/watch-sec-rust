@@ -80,6 +80,21 @@ pub async fn start(config: AgentConfig, event_tx: tokio::sync::mpsc::UnboundedSe
 }
 
 fn handle_message(text: String, config: &AgentConfig, event_tx: &tokio::sync::mpsc::UnboundedSender<Value>) {
+    // Engine.IO open packet: respond with Socket.IO connect (40) containing agent auth
+    if text.starts_with('0') {
+        println!("[WebSocket] Received Engine.IO Open. Sending Socket.IO connect payload...");
+        let auth_payload = serde_json::json!({
+            "apiKey": config.tenant_api_key,
+            "room": config.agent_id,
+            "machineSecret": config.machine_secret
+        });
+        let handshake = format!("40{}", auth_payload);
+        if let Some(ref tx) = *WS_TX.lock().unwrap() {
+            let _ = tx.try_send(handshake);
+        }
+        return;
+    }
+
     // Engine.IO pong
     if text == "3" {
         return;
@@ -96,6 +111,34 @@ fn handle_message(text: String, config: &AgentConfig, event_tx: &tokio::sync::mp
                         let data = &arr[1];
 
                         if let Some(obj) = data.as_object() {
+                            // Handle C2 authentication handshake events
+                            if event_name == "identity_challenge" {
+                                let challenge = obj.get("challenge").and_then(|v| v.as_str()).unwrap_or("");
+                                if !challenge.is_empty() {
+                                    let mut key_seed = config.tenant_api_key.as_bytes().to_vec();
+                                    key_seed.extend_from_slice(config.machine_secret.as_bytes());
+                                    let secret = ring::digest::digest(&ring::digest::SHA256, &key_seed);
+                                    let s_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_ref());
+                                    let tag = ring::hmac::sign(&s_key, challenge.as_bytes());
+                                    let sig_hex = hex::encode(tag.as_ref());
+
+                                    let resp = serde_json::json!(["verify_identity", {
+                                        "signature": sig_hex
+                                    }]);
+                                    let packet = format!("42{}", resp);
+                                    if let Some(ref tx) = *WS_TX.lock().unwrap() {
+                                        let _ = tx.try_send(packet);
+                                    }
+                                    println!("[WebSocket] Replied to identity_challenge.");
+                                }
+                                return;
+                            }
+
+                            if event_name == "identity_verified" {
+                                println!("[WebSocket] ✓ Agent identity cryptographically verified with C2.");
+                                return;
+                            }
+
                             let signature = obj.get("signature").and_then(|v| v.as_str()).unwrap_or("");
                             let timestamp = obj.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
                             
