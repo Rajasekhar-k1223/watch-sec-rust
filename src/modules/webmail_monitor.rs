@@ -42,7 +42,7 @@ pub fn capture_webmail_events() -> Vec<Value> {
             
             crate::log_msg(&format!("[WebmailMonitor] Detected Webmail session: {}", current_title));
             
-            // Capture keystrokes from the clipboard as a body heuristic
+            // Capture real live dynamic clipboard as body heuristic
             let draft_body = capture_draft_body();
             let risk = assess_dlp_risk(&draft_body);
             
@@ -74,86 +74,107 @@ fn assess_dlp_risk(body: &str) -> &'static str {
 }
 
 fn capture_draft_body() -> String {
-    // Attempt to read clipboard as a body heuristic
-    #[cfg(target_os = "windows")]
-    {
-        // On Windows, use the clipboard module if available
-        return "[Heuristic Capture] User is composing an email via a web browser.".to_string();
+    // Dynamic cross-platform clipboard capture using arboard
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        if let Ok(text) = cb.get_text() {
+            if !text.is_empty() {
+                let sample: String = text.chars().take(500).collect();
+                return format!("[Dynamic Live Clipboard] {}", sample);
+            }
+        }
     }
+
+    // Fallback on Linux to xclip if display server isolation applies
     #[cfg(not(target_os = "windows"))]
     {
-        // On Linux/macOS, try xclip/pbpaste to sample clipboard
         if let Ok(out) = crate::hidden_command!("xclip")
             .args(&["-selection", "clipboard", "-o"])
             .output()
         {
             let text = String::from_utf8_lossy(&out.stdout).to_string();
             if !text.is_empty() {
-                return format!("[Clipboard Heuristic] {}", &text[..text.len().min(500)]);
+                return format!("[Dynamic XClip Capture] {}", &text[..text.len().min(500)]);
             }
         }
-        "[Heuristic Capture] User is composing an email via a web browser.".to_string()
     }
+
+    "[No active clipboard text detected during compose session]".to_string()
 }
 
 // ── Platform-specific active window title detection ───────────────────────────
 
-#[cfg(target_os = "windows")]
+#[cfg(target_os = "linux")]
 fn get_active_window_title() -> String {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW};
-    let mut window_title = String::new();
-    unsafe {
-        let hwnd: HWND = GetForegroundWindow();
-        if hwnd.0 != 0 {
-            let mut title_buf = [0u16; 512];
-            let len = GetWindowTextW(hwnd, &mut title_buf);
-            if len > 0 {
-                window_title = String::from_utf16_lossy(&title_buf[..len as usize]);
+    // Try xdotool first (most reliable on X11)
+    if let Ok(out) = crate::hidden_command!("xdotool")
+        .args(&["getactivewindow", "getwindowname"])
+        .output()
+    {
+        let title = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !title.is_empty() {
+            return title;
+        }
+    }
+
+    // Fallback: xprop
+    if let Ok(out) = crate::hidden_command!("xprop")
+        .args(&["-root", "_NET_ACTIVE_WINDOW"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Look for window ID: _NET_ACTIVE_WINDOW(WINDOW): window id # 0x...
+        if let Some(id_part) = stdout.split('#').nth(1) {
+            let win_id = id_part.trim().split_whitespace().next().unwrap_or("").trim();
+            if !win_id.is_empty() && win_id != "0x0" {
+                if let Ok(name_out) = crate::hidden_command!("xprop")
+                    .args(&["-id", win_id, "_NET_WM_NAME"])
+                    .output()
+                {
+                    let name_str = String::from_utf8_lossy(&name_out.stdout);
+                    if let Some(val) = name_str.split('=').nth(1) {
+                        return val.trim().trim_matches('"').to_string();
+                    }
+                }
             }
         }
     }
-    window_title
-}
 
-#[cfg(target_os = "linux")]
-fn get_active_window_title() -> String {
-    // xdotool is the standard cross-DE tool for reading the active window title
-    if let Ok(out) = crate::hidden_command!("xdotool")
-        .args(&["getactivewindow", "getwindowname"])
-        .env("DISPLAY", ":0")
-        .output()
-    {
-        if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout).trim().to_string();
-        }
-    }
-    // Fallback: wmctrl
-    if let Ok(out) = crate::hidden_command!("wmctrl")
-        .args(&["-a", ":ACTIVE:"])
-        .output()
-    {
-        let _ = out; // wmctrl -a doesn't print the title; skip it
-    }
     String::new()
 }
 
 #[cfg(target_os = "macos")]
 fn get_active_window_title() -> String {
-    // AppleScript query for the frontmost window name
-    let script = r#"tell application "System Events" to get name of first window of (first process whose frontmost is true)"#;
-    if let Ok(out) = crate::hidden_command!("osascript")
-        .args(&["-e", script])
-        .output()
-    {
-        if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout).trim().to_string();
-        }
+    let script = r#"
+        tell application "System Events"
+            set frontApp to first application process whose frontmost is true
+            set windowTitle to ""
+            try
+                tell frontApp to set windowTitle to name of front window
+            end try
+            return windowTitle
+        end tell
+    "#;
+
+    if let Ok(out) = crate::hidden_command!("osascript").arg("-e").arg(script).output() {
+        return String::from_utf8_lossy(&out.stdout).trim().to_string();
     }
     String::new()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(target_os = "windows")]
 fn get_active_window_title() -> String {
-    String::new()
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW};
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0 == 0 {
+            return String::new();
+        }
+        let mut buf = [0u16; 512];
+        let len = GetWindowTextW(hwnd, &mut buf);
+        if len > 0 {
+            String::from_utf16_lossy(&buf[..len as usize])
+        } else {
+            String::new()
+        }
+    }
 }

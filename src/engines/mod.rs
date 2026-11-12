@@ -8,3 +8,4 @@ pub mod ebpf_tracer;
 pub mod mitre_mapper;
 pub mod memory_scan;
 pub mod plugin_mgr;
+pub mod safeinstall_enforcer;

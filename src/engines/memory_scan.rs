@@ -25,11 +25,26 @@ pub fn scan_memory() -> serde_json::Value {
                                 // In a full implementation, we would seek to the memory offsets and read the raw bytes.
                                 // For performance and safety in this agent, we flag the presence of the segment.
                                 let mut found_malware_sig = false;
-                                
-                                // Simulated deep memory read of the segment
-                                let dummy_memory_content = "Vigenere MZ header CobaltStrike Mimikatz";
-                                if dummy_memory_content.contains("CobaltStrike") || dummy_memory_content.contains("Mimikatz") {
-                                    found_malware_sig = true;
+                                let cmdline_path = format!("/proc/{}/cmdline", pid_str);
+                                let cmdline = fs::read_to_string(&cmdline_path).unwrap_or_default();
+
+                                // Real dynamic check on anonymous RWX segment memory
+                                if let Some(addr_range) = line.split_whitespace().next() {
+                                    if let Some(start_str) = addr_range.split('-').next() {
+                                        if let Ok(start_addr) = u64::from_str_radix(start_str, 16) {
+                                            let mem_path = format!("/proc/{}/mem", pid_str);
+                                            use std::os::unix::fs::FileExt;
+                                            if let Ok(mem_file) = fs::File::open(&mem_path) {
+                                                let mut buf = [0u8; 1024];
+                                                if mem_file.read_at(&mut buf, start_addr).is_ok() {
+                                                    let s = String::from_utf8_lossy(&buf);
+                                                    if s.contains("CobaltStrike") || s.contains("Mimikatz") || s.contains("eval(base64") || s.contains("/bin/sh") {
+                                                        found_malware_sig = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
 
                                 if found_malware_sig {

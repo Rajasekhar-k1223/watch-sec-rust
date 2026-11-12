@@ -137,6 +137,23 @@ pub fn start_sandbox_monitor(event_tx: UnboundedSender<serde_json::Value>, live_
                                     let original_filename = path_buf.file_name().unwrap_or_default().to_string_lossy().into_owned();
 
                                     tokio::spawn(async move {
+                                        // 0. Check Local Endpoint Verdict Cache (<0.5ms)
+                                        use crate::engines::safeinstall_enforcer::SafeInstallEnforcer;
+                                        if let Some(cached) = SafeInstallEnforcer::query_local_cache(&file_hash) {
+                                            if cached.allow_execution {
+                                                let _ = fs::rename(&pending_path, &path_str);
+                                                println!("[Sandbox] File {} is SAFE (Local Cache Hit) and restored.", original_filename);
+                                                return;
+                                            } else {
+                                                let quarantine_dir = PathBuf::from(if cfg!(target_os = "windows") { "C:\\ProgramData\\Monitorix\\Quarantine" } else { "/opt/monitorix/quarantine" });
+                                                let _ = fs::create_dir_all(&quarantine_dir);
+                                                let q_path = quarantine_dir.join(format!("{}_{}.quarantine", original_filename, chrono::Utc::now().timestamp()));
+                                                let _ = fs::rename(&pending_path, &q_path);
+                                                println!("[Sandbox] File {} QUARANTINED (Local Cache Block): {}", original_filename, cached.reason);
+                                                return;
+                                            }
+                                        }
+
                                         // A. Hash-First API
                                         let ts = chrono::Utc::now().timestamp().to_string();
                                         let check_payload = json!({
@@ -206,7 +223,9 @@ pub fn start_sandbox_monitor(event_tx: UnboundedSender<serde_json::Value>, live_
                                             }
                                         }
 
-                                        // C. Handle Verdict
+                                        // C. Handle Verdict & Cache in Local Store
+                                        SafeInstallEnforcer::store_local_verdict(&file_hash, &final_status, &reason_str);
+
                                         if final_status == "SAFE" {
                                             let _ = fs::rename(&pending_path, &path_str);
                                             println!("[Sandbox] File {} is SAFE and restored.", original_filename);
@@ -228,9 +247,17 @@ pub fn start_sandbox_monitor(event_tx: UnboundedSender<serde_json::Value>, live_
                                                 "Filename": original_filename,
                                                 "Reason": reason_str
                                             }));
+                                        } else if final_status == "HOLD" {
+                                            println!("[Sandbox] File {} is on HOLD pending administrator approval.", original_filename);
+                                            let _ = et_tx.send(json!({
+                                                "EventType": "SandboxFileHold",
+                                                "Filename": original_filename,
+                                                "Reason": reason_str,
+                                                "Hash": file_hash
+                                            }));
                                         } else {
-                                            // Network failure or unknown error, fallback to safe
-                                            let _ = fs::rename(&pending_path, &path_str);
+                                            // Network failure or timeout: Fail-Closed enforcement (retain .sandbox_pending lock)
+                                            crate::log_msg(&format!("[Sandbox] Verification pending or server unreachable for {}. Retaining lock.", original_filename));
                                         }
                                     });
                                 }
