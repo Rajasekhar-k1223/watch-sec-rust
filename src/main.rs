@@ -85,10 +85,17 @@ async fn main() {
 
     init_file_logger();
 
-    // Check for --worker flag to determine if we are the watchdog or the worker
+    // Check for special utility flags
     let args: Vec<String> = std::env::args().collect();
     let is_worker = args.iter().any(|a| a.contains("--worker"));
     let is_enroll = args.iter().any(|a| a.contains("--enroll"));
+    let is_screencapture = args.iter().any(|a| a.contains("--screencapture"));
+
+    #[cfg(target_os = "windows")]
+    if is_screencapture {
+        let _ = crate::modules::screenshot_capture::capture_gdi_direct();
+        std::process::exit(0);
+    }
     
     // Do not run Watchdog if we are just enrolling
     if !is_worker && !is_enroll {

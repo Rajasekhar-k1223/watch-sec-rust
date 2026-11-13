@@ -79,7 +79,135 @@ fn do_capture() -> bool {
 }
 
 #[cfg(target_os = "windows")]
+pub fn capture_gdi_direct() -> bool {
+    unsafe {
+        let hwnd = windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow();
+        let hdc_screen = windows::Win32::Graphics::Gdi::GetDC(hwnd);
+        if hdc_screen.is_invalid() {
+            return false;
+        }
+        let hdc_mem = windows::Win32::Graphics::Gdi::CreateCompatibleDC(hdc_screen);
+        if hdc_mem.is_invalid() {
+            let _ = windows::Win32::Graphics::Gdi::ReleaseDC(hwnd, hdc_screen);
+            return false;
+        }
+
+        let width = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN);
+        let height = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN);
+
+        if width <= 0 || height <= 0 {
+            let _ = windows::Win32::Graphics::Gdi::DeleteDC(hdc_mem);
+            let _ = windows::Win32::Graphics::Gdi::ReleaseDC(hwnd, hdc_screen);
+            return false;
+        }
+
+        let hbm = windows::Win32::Graphics::Gdi::CreateCompatibleBitmap(hdc_screen, width, height);
+        if hbm.is_invalid() {
+            let _ = windows::Win32::Graphics::Gdi::DeleteDC(hdc_mem);
+            let _ = windows::Win32::Graphics::Gdi::ReleaseDC(hwnd, hdc_screen);
+            return false;
+        }
+
+        let h_old = windows::Win32::Graphics::Gdi::SelectObject(hdc_mem, hbm);
+
+        // Copy screen to memory DC
+        let _ = windows::Win32::Graphics::Gdi::BitBlt(
+            hdc_mem, 0, 0, width, height, hdc_screen, 0, 0, windows::Win32::Graphics::Gdi::SRCCOPY,
+        );
+
+        // Get bitmap bits
+        let mut bmi: windows::Win32::Graphics::Gdi::BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader.biSize = std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = width;
+        bmi.bmiHeader.biHeight = -height; // Top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = windows::Win32::Graphics::Gdi::BI_RGB.0 as u32;
+
+        let mut buffer: Vec<u8> = vec![0; (width * height * 4) as usize];
+        let lines = windows::Win32::Graphics::Gdi::GetDIBits(
+            hdc_screen,
+            hbm,
+            0,
+            height as u32,
+            Some(buffer.as_mut_ptr() as *mut _),
+            &mut bmi,
+            windows::Win32::Graphics::Gdi::DIB_RGB_COLORS,
+        );
+
+        // Cleanup GDI
+        let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc_mem, h_old);
+        let _ = windows::Win32::Graphics::Gdi::DeleteObject(hbm);
+        let _ = windows::Win32::Graphics::Gdi::DeleteDC(hdc_mem);
+        let _ = windows::Win32::Graphics::Gdi::ReleaseDC(hwnd, hdc_screen);
+
+        if lines <= 0 {
+            return false;
+        }
+
+        // Convert BGRA to RGBA for image crate
+        for chunk in buffer.chunks_exact_mut(4) {
+            let b = chunk[0];
+            let r = chunk[2];
+            chunk[0] = r;
+            chunk[2] = b;
+            chunk[3] = 255;
+        }
+
+        if let Some(img) = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width as u32, height as u32, buffer) {
+            img.save(SAVE_PATH).is_ok()
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn capture_powershell() -> bool {
+    let script = r#"
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+$s = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+$b = New-Object System.Drawing.Bitmap $s.Width, $s.Height
+$g = [System.Drawing.Graphics]::FromImage($b)
+$g.CopyFromScreen($s.Location, [System.Drawing.Point]::Empty, $s.Size)
+$b.Save('C:\Users\Public\monitorix_screenshot.png')
+$g.Dispose()
+$b.Dispose()
+"#;
+    let out = crate::hidden_command!("powershell")
+        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .output();
+    out.map(|o| o.status.success()).unwrap_or(false) && std::path::Path::new(SAVE_PATH).exists()
+}
+
+#[cfg(target_os = "windows")]
 fn do_capture() -> bool {
+    // 1. Direct in-process Win32 GDI capture (ultra-fast, native, zero dependencies)
+    if capture_gdi_direct() {
+        return true;
+    }
+
+    // 2. Fallback to PowerShell Screen Capture (standard on all Windows versions)
+    if capture_powershell() {
+        return true;
+    }
+
+    // 3. Fallback: check helper binary if available
+    let helper_locations = [
+        std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("monitorix-screencapture.exe"))),
+        Some(std::path::PathBuf::from("C:\\Program Files\\Monitorix\\monitorix-screencapture.exe")),
+    ];
+
+    for loc in helper_locations.iter().flatten() {
+        if loc.exists() {
+            let out = crate::hidden_command!(loc.to_str().unwrap_or("")).output();
+            if out.map(|o| o.status.success()).unwrap_or(false) && std::path::Path::new(SAVE_PATH).exists() {
+                return true;
+            }
+        }
+    }
+
+    // 4. Fallback for Session 0 (system service) -> execute via schtasks in active user's desktop session
     let mut s_id = 0;
     unsafe {
         let _ = windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(
@@ -87,46 +215,30 @@ fn do_capture() -> bool {
             &mut s_id,
         );
     }
-    
-    // NATIVE APPROACH: Execute our secondary helper binary instead of powershell
-    let exe_path = "C:\\Program Files\\Monitorix\\monitorix-screencapture.exe";
 
     if s_id == 0 {
-        // Find the active interactive user (e.g. RDP session)
-        let mut active_user = String::new();
         if let Ok(output) = crate::hidden_command!("cmd").args(&["/c", "query user | findstr /i active"]).output() {
             let out_str = String::from_utf8_lossy(&output.stdout);
             let parts: Vec<&str> = out_str.split_whitespace().collect();
             if !parts.is_empty() {
-                active_user = parts[0].trim_start_matches('>').to_string();
+                let active_user = parts[0].trim_start_matches('>');
+                if let Ok(current_exe) = std::env::current_exe() {
+                    let exe_str = current_exe.to_string_lossy().to_string();
+                    let _ = crate::hidden_command!("schtasks")
+                        .args(&["/Create", "/TN", "MonitorixCapture", "/TR", &format!("\"{}\" --screencapture", exe_str), "/SC", "ONCE", "/ST", "00:00", "/RU", active_user, "/IT", "/F"])
+                        .output();
+                    let _ = crate::hidden_command!("schtasks").args(&["/Run", "/TN", "MonitorixCapture"]).output();
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    let _ = crate::hidden_command!("schtasks").args(&["/Delete", "/TN", "MonitorixCapture", "/F"]).output();
+                    if std::path::Path::new(SAVE_PATH).exists() {
+                        return true;
+                    }
+                }
             }
         }
-
-        if active_user.is_empty() {
-            return false; // No active user to capture
-        }
-
-        // Schedule and run the task in the active user's session
-        let _ = crate::hidden_command!("schtasks")
-            .args(&["/Create", "/TN", "MonitorixCapture", "/TR", exe_path, "/SC", "ONCE", "/ST", "00:00", "/RU", &active_user, "/IT", "/F"])
-            .output();
-            
-        let _ = crate::hidden_command!("schtasks")
-            .args(&["/Run", "/TN", "MonitorixCapture"])
-            .output();
-            
-        std::thread::sleep(std::time::Duration::from_millis(1500)); // Allow time to capture
-        
-        let _ = crate::hidden_command!("schtasks")
-            .args(&["/Delete", "/TN", "MonitorixCapture", "/F"])
-            .output();
-            
-        return true;
     }
 
-    // Interactive user session -> run helper directly
-    let out = crate::hidden_command!(exe_path).output();
-    out.map(|o| o.status.success()).unwrap_or(false)
+    false
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
