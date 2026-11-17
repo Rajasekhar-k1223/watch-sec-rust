@@ -1,6 +1,6 @@
 [package]
 name = "monitorix-agent"
-version = "4.2.6"
+version = "4.2.5"
 edition = "2021"
 
 [dependencies]
