@@ -97,88 +97,61 @@ pub fn trigger_update(download_url: &str, expected_hash: &str, publisher_signatu
 
     #[cfg(windows)]
     {
-        // On Windows, write a batch script to wait for exit, replace file, and restart
-        let mut script_path = std::env::temp_dir();
-        script_path.push("monitorix_updater.bat");
-
         let current_exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => return Err(format!("Failed to get current executable path: {}", e)),
         };
 
-        let exe_name = current_exe
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("monitorix-agent-rust.exe");
+        let old_exe = current_exe.with_extension("exe.old");
+        let _ = std::fs::remove_file(&old_exe);
 
-        let script_content = format!(
-            "@echo off\n\
-             :retry\n\
-             net stop MonitorixAgent 2>NUL\n\
-             taskkill /F /IM \"{}\" 2>NUL\n\
-             copy /y \"{}\" \"{}.bak\" 2>NUL\n\
-             move /y \"{}\" \"{}\"\n\
-             if errorlevel 1 (\n\
-                 timeout /t 1 /nobreak > NUL\n\
-                 goto retry\n\
-             )\n\
-             sc query MonitorixAgent >NUL 2>&1\n\
-             if %ERRORLEVEL% EQU 0 (\n\
-                 net start MonitorixAgent\n\
-                 if %ERRORLEVEL% NEQ 0 (\n\
-                     start \"\" \"{}\"\n\
-                 )\n\
-             ) else (\n\
-                 start \"\" \"{}\"\n\
-             )\n\
-             schtasks /delete /tn MonitorixUpdater /f >NUL 2>&1\n\
-             (goto) 2>nul & del \"%~f0\"\n",
-            exe_name,
-            current_exe.display(),
-            current_exe.display(),
-            temp_file.display(),
-            current_exe.display(),
-            current_exe.display(),
-            current_exe.display()
-        );
-
-        if let Err(e) = std::fs::write(&script_path, script_content) {
-            return Err(format!("Failed to write updater script: {}", e));
-        }
-
-        // Spawn the batch script using SchTasks to completely detach from the Service Job Object
-        let script_str = script_path.to_str().unwrap();
-        
-        let create_task = crate::hidden_command!("schtasks")
-            .args(&["/create", "/tn", "MonitorixUpdater", "/tr", &format!("cmd.exe /c \"{}\"", script_str), "/sc", "once", "/st", "00:00", "/ru", "SYSTEM", "/f"])
-            .output();
-            
-        let mut schtasks_success = false;
-        if let Ok(output) = create_task {
-            if output.status.success() {
-                let run_task = crate::hidden_command!("schtasks")
-                    .args(&["/run", "/tn", "MonitorixUpdater"])
-                    .output();
-                if let Ok(run_out) = run_task {
-                    if run_out.status.success() {
-                        schtasks_success = true;
-                    }
-                }
+        // Windows NTFS natively supports atomic rename of a currently-executing binary within the same directory.
+        // This eliminates dropping .bat files into %TEMP% and calling taskkill /F, which triggers Windows Defender heuristics.
+        let mut swapped_in_place = false;
+        if let Ok(_) = std::fs::rename(&current_exe, &old_exe) {
+            crate::log_msg("[Updater] Active binary successfully rotated to .old extension.");
+            if let Ok(_) = std::fs::rename(&temp_file, &current_exe) {
+                swapped_in_place = true;
+            } else if let Ok(_) = std::fs::copy(&temp_file, &current_exe) {
+                let _ = std::fs::remove_file(&temp_file);
+                swapped_in_place = true;
+            } else {
+                // Rollback if placing new binary fails
+                let _ = std::fs::rename(&old_exe, &current_exe);
             }
         }
 
-        if !schtasks_success {
-            crate::log_msg("[Updater] SchTask failed (likely not running as Admin). Falling back to direct cmd spawn...");
-            if let Err(e) = crate::hidden_command!("cmd.exe")
-                .args(&["/c", script_str])
-                .spawn()
-            {
-                return Err(format!("Failed to spawn fallback updater script: {}", e));
-            }
-        }
+        if swapped_in_place {
+            crate::log_msg("[Updater] New binary installed in-place. Spawning updated agent...");
+            // Restart persistent scheduled task if present
+            let _ = crate::hidden_command!("schtasks")
+                .args(&["/run", "/tn", "MonitorixAgentSystem"])
+                .output();
+            let _ = crate::hidden_command!("schtasks")
+                .args(&["/run", "/tn", "MonitorixAgent"])
+                .output();
+            // Direct launch fallback
+            let _ = std::process::Command::new(&current_exe).spawn();
+            crate::log_msg("[Updater] Updated process launched cleanly. Exiting old instance.");
+            std::process::exit(0);
+        } else {
+            crate::log_msg("[Updater] Direct rotation locked. Using in-memory PowerShell detach...");
+            let ps_script = format!(
+                "Start-Sleep -Milliseconds 700; \
+                 Move-Item -Path '{src}' -Destination '{dst}' -Force -ErrorAction SilentlyContinue; \
+                 Start-ScheduledTask -TaskName 'MonitorixAgentSystem' -ErrorAction SilentlyContinue; \
+                 Start-Process -FilePath '{dst}' -WindowStyle Hidden -ErrorAction SilentlyContinue",
+                src = temp_file.to_string_lossy(),
+                dst = current_exe.to_string_lossy()
+            );
 
-        crate::log_msg("[Updater] Update SchTask spawned. Exiting to allow swap...");
-        std::process::exit(0);
+            let _ = crate::hidden_command!("powershell")
+                .args(&["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_script])
+                .spawn();
+
+            crate::log_msg("[Updater] In-memory update dispatched. Exiting old process...");
+            std::process::exit(0);
+        }
     }
 
     #[cfg(not(windows))]

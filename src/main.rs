@@ -90,15 +90,34 @@ async fn main() {
     let is_worker = args.iter().any(|a| a.contains("--worker"));
     let is_enroll = args.iter().any(|a| a.contains("--enroll"));
     let is_screencapture = args.iter().any(|a| a.contains("--screencapture"));
+    let is_stream_worker = args.iter().any(|a| a.contains("--stream-worker"));
+
+    #[cfg(target_os = "windows")]
+    if is_stream_worker {
+        crate::modules::screenshot_capture::run_stream_worker();
+        std::process::exit(0);
+    }
 
     #[cfg(target_os = "windows")]
     if is_screencapture {
-        let _ = crate::modules::screenshot_capture::capture_gdi_direct();
+        let captured = crate::modules::screenshot_capture::capture_gdi_direct();
+        if !captured {
+            let _ = crate::modules::screenshot_capture::capture_powershell();
+        }
         std::process::exit(0);
     }
     
     // Do not run Watchdog if we are just enrolling
     if !is_worker && !is_enroll {
+        // Watchdog single-instance lock across the machine
+        let _watchdog_lock = match std::net::TcpListener::bind("127.0.0.1:48391") {
+            Ok(listener) => listener,
+            Err(_) => {
+                log_msg("[Watchdog] Another supervisor instance is already active on this endpoint. Exiting.");
+                std::process::exit(0);
+            }
+        };
+
         log_msg("[Boot] Starting in Watchdog Mode...");
         let current_exe = std::env::current_exe().expect("Failed to get current executable path");
 
@@ -190,50 +209,26 @@ async fn main() {
         }
         log_msg(&format!("[Boot] Detected Windows Session ID: {}", session_id));
         
-        if session_id == 0 {
-            let args: Vec<String> = std::env::args().collect();
-            if !args.iter().any(|a| a == "--escaped") {
-                log_msg("[Boot] Trapped in Session 0! Attempting to escape via PowerShell and schtasks...");
-                let script = r#"
-                    $user = (Get-WmiObject -Class Win32_ComputerSystem).UserName
-                    if ($user) {
-                        Write-Host $user
-                    }
-                "#;
-                let output = crate::hidden_command!("powershell")
-                    .args(&["-NoProfile", "-Command", script])
-                    .output();
-                    
-                if let Ok(out) = output {
-                    let active_user = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if !active_user.is_empty() {
-                        log_msg(&format!("[Boot] Found active user: {}", active_user));
-                        let exe_path = std::env::current_exe().unwrap().to_string_lossy().to_string();
-                        
-                        let _ = crate::hidden_command!("schtasks")
-                            .args(&["/Create", "/F", "/TN", "MonitorixEscape", "/TR", &format!("\"{}\" --escaped", exe_path), "/SC", "ONCE", "/ST", "00:00", "/RU", &active_user])
-                            .output();
-                            
-                        let _ = crate::hidden_command!("schtasks")
-                            .args(&["/Run", "/TN", "MonitorixEscape"])
-                            .output();
-                            
-                        log_msg("[Boot] Triggered escape task. SYSTEM agent continuing in Session 0.");
-                        // Do NOT exit here! The SYSTEM agent must stay alive to handle updates and network monitoring.
-                    } else {
-                        log_msg("[Boot] Failed to find active user. Cannot escape.");
-                    }
-                }
+        // Clean up legacy escape task if it was previously created
+        let _ = crate::hidden_command!("schtasks")
+            .args(&["/Delete", "/TN", "MonitorixEscape", "/F"])
+            .output();
+
+        // Clean up rotated binary from previous atomic update
+        if let Ok(current_exe) = std::env::current_exe() {
+            let old_exe = current_exe.with_extension("exe.old");
+            if old_exe.exists() {
+                let _ = std::fs::remove_file(old_exe);
             }
         }
     }
 
-    // Single instance lock (per session)
-    let lock_port = 48392 + session_id as u16;
+    // Global single-instance lock across the endpoint for the Worker process
+    let lock_port = 48392;
     let _instance_lock = match std::net::TcpListener::bind(format!("127.0.0.1:{}", lock_port)) {
         Ok(listener) => listener,
         Err(_) => {
-            log_msg(&format!("[Boot] Another agent instance is already running in Session {}. Exiting.", session_id));
+            log_msg("[Boot] Another agent worker instance is already active on this endpoint. Exiting cleanly.");
             std::process::exit(0);
         }
     };
@@ -695,9 +690,16 @@ async fn main() {
                  upload_machine_secret.clone(), upload_tenant_key.clone())
             };
 
-            // Capture for internal event bus even when upload disabled
+            // Capture for internal event bus only when actual content exists or violation detected
             let clipboard = modules::clipboard_audit::audit_clipboard();
-            let _ = security_tx.send(clipboard);
+            let is_violation = clipboard.get("IsViolation").and_then(|v| v.as_bool()).unwrap_or(false);
+            let has_content = clipboard.get("ClipboardContents")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty() && !s.starts_with('[') && !s.starts_with("No active"))
+                .unwrap_or(false);
+            if is_violation || has_content {
+                let _ = security_tx.send(clipboard);
+            }
 
             let location = modules::location_tracking::track_location();
             let _ = security_tx.send(location);
@@ -969,6 +971,7 @@ async fn main() {
     tokio::spawn(async move {
         let mut last_screenshot = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(3600)).unwrap_or_else(std::time::Instant::now);
         let mut last_clipboard = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(3600)).unwrap_or_else(std::time::Instant::now);
+        let mut last_clipboard_text = String::new();
         let mut scan_interval = time::interval(std::time::Duration::from_secs(5));
         loop {
             scan_interval.tick().await;
@@ -1018,7 +1021,14 @@ async fn main() {
                 last_clipboard = std::time::Instant::now();
                 let clipboard = crate::modules::clipboard_audit::audit_clipboard();
                 if let Some(contents) = clipboard.get("ClipboardContents").and_then(|v| v.as_str()) {
-                    if !contents.is_empty() && contents != "[Clipboard is empty]" {
+                    let is_noise = contents.is_empty()
+                        || contents.starts_with("[Clipboard")
+                        || contents.starts_with("No active display")
+                        || contents.starts_with("xclip missing")
+                        || contents == "[REDACTED BY DATAGUARD]";
+
+                    if !is_noise && contents != last_clipboard_text.as_str() {
+                        last_clipboard_text = contents.to_string();
                         let lower_contents = contents.to_lowercase();
                         let keywords = ["password", "confidential", "secret", "credit card", "api_key"];
                         let is_alert = keywords.iter().any(|k| lower_contents.contains(k));

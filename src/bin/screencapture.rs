@@ -48,17 +48,24 @@ fn main() {
         let _ = DeleteDC(hdc_mem);
         let _ = ReleaseDC(hwnd, hdc_screen);
 
-        // Convert BGRA to RGBA for image crate
+        // Convert BGRA to RGBA for image crate and verify display content
+        let mut non_black_count: usize = 0;
         for chunk in buffer.chunks_exact_mut(4) {
             let b = chunk[0];
+            let g = chunk[1];
             let r = chunk[2];
+            if r > 15 || g > 15 || b > 15 {
+                non_black_count += 1;
+            }
             chunk[0] = r;
             chunk[2] = b;
             chunk[3] = 255; // Alpha
         }
 
-        if let Some(img) = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width as u32, height as u32, buffer) {
-            let _ = img.save("C:\\Users\\Public\\monitorix_screenshot.png");
+        if non_black_count >= 100 {
+            if let Some(img) = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width as u32, height as u32, buffer) {
+                let _ = img.save("C:\\Users\\Public\\monitorix_screenshot.png");
+            }
         }
     }
 }

@@ -95,7 +95,15 @@ fn handle_message(text: String, config: &AgentConfig, event_tx: &tokio::sync::mp
         return;
     }
 
-    // Engine.IO pong
+    // Engine.IO ping from server ("2"): respond with pong ("3") to keep connection alive
+    if text == "2" {
+        if let Some(ref tx) = *WS_TX.lock().unwrap() {
+            let _ = tx.try_send("3".to_string());
+        }
+        return;
+    }
+
+    // Engine.IO pong ("3")
     if text == "3" {
         return;
     }
@@ -352,8 +360,20 @@ fn handle_message(text: String, config: &AgentConfig, event_tx: &tokio::sync::mp
                                     let download_url = params.get("DownloadUrl").and_then(|v| v.as_str()).unwrap_or("");
                                     let expected_hash = params.get("ExpectedHash").and_then(|v| v.as_str()).unwrap_or("");
                                     let publisher_signature = params.get("PublisherSignature").and_then(|v| v.as_str()).unwrap_or("");
-                                    let progress_cb = Box::new(|percent: u64| {
+                                    let agent_id_cb = config.agent_id.clone();
+                                    let backend_url_cb = config.backend_url.clone();
+                                    let api_key_cb = config.tenant_api_key.clone();
+
+                                    let progress_cb = Box::new(move |percent: u64| {
                                         println!("[Updater] WebSocket trigger download progress: {}%", percent);
+                                        let report_url = format!("{}/api/agents/{}/update-progress", backend_url_cb, agent_id_cb);
+                                        let client = reqwest::blocking::Client::builder()
+                                            .timeout(std::time::Duration::from_secs(5))
+                                            .build().unwrap_or_default();
+                                        let _ = client.post(&report_url)
+                                            .header("X-Tenant-Api-Key", &api_key_cb)
+                                            .json(&serde_json::json!({"progress": percent, "status": "downloading"}))
+                                            .send();
                                     });
                                     match crate::modules::updater::trigger_update(download_url, expected_hash, publisher_signature, progress_cb) {
                                         Ok(msg) => println!("[Remediation] Updater:\n{}", msg),
